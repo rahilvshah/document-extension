@@ -113,10 +113,6 @@ export interface Session {
   updatedAt: number;
 }
 
-export interface SessionWithSteps extends Session {
-  steps: Step[];
-}
-
 // ── Step ──
 
 export interface Step {
@@ -173,11 +169,6 @@ export interface UpdateStepsRequest {
   deletedStepIds?: string[];
 }
 
-export interface ExportFormat {
-  format: 'markdown' | 'html';
-  inline?: boolean; // base64 inline images vs zip with files
-}
-
 // ── Extension Messages ──
 
 export type ExtensionMessageType =
@@ -192,7 +183,9 @@ export type ExtensionMessageType =
   | 'RESUME_CAPTURE'
   | 'HIDE_TOOLBAR'
   | 'SHOW_TOOLBAR'
-  | 'GET_STATE';
+  | 'GET_STATE'
+  | 'PERSIST_EDIT'
+  | 'APPLY_EDITS';
 
 export interface ExtensionMessage {
   type: ExtensionMessageType;

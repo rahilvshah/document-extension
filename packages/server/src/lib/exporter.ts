@@ -1,145 +1,17 @@
 import fs from 'fs';
-import fsp from 'fs/promises';
-import path from 'path';
 import archiver from 'archiver';
 import { Writable } from 'stream';
 import type { Step, Session } from '@docext/shared';
-import { getScreenshotPath, screenshotExists } from './screenshot-store.js';
+import { getScreenshotPath } from './screenshot-store.js';
 import { db, schema } from '../db/index.js';
-import { eq, inArray } from 'drizzle-orm';
+import { inArray } from 'drizzle-orm';
 
 interface ExportData {
   session: Session;
   steps: Step[];
 }
 
-async function loadScreenshotBase64(screenshotId: string): Promise<string | null> {
-  const row = await db.query.screenshots.findFirst({
-    where: eq(schema.screenshots.id, screenshotId),
-  });
-  if (!row) return null;
-
-  const fullPath = getScreenshotPath(row.filePath);
-  if (!screenshotExists(row.filePath)) return null;
-
-  const buffer = await fsp.readFile(fullPath);
-  return `data:image/webp;base64,${buffer.toString('base64')}`;
-}
-
-export async function exportMarkdown(data: ExportData, inline = true): Promise<string> {
-  const lines: string[] = [];
-  lines.push(`# ${data.session.title}`);
-  lines.push('');
-  lines.push(`> Recorded from [${data.session.startUrl}](${data.session.startUrl})`);
-  lines.push(`> Date: ${new Date(data.session.createdAt).toLocaleDateString()}`);
-  lines.push('');
-  lines.push('---');
-  lines.push('');
-
-  for (let i = 0; i < data.steps.length; i++) {
-    const step = data.steps[i];
-    lines.push(`## Step ${i + 1}: ${step.title}`);
-    lines.push('');
-
-    if (step.description) {
-      lines.push(step.description);
-      lines.push('');
-    }
-
-    if (step.screenshotId) {
-      if (inline) {
-        const b64 = await loadScreenshotBase64(step.screenshotId);
-        if (b64) {
-          lines.push(`![Step ${i + 1} - Light](${b64})`);
-        }
-      } else {
-        lines.push(`![Step ${i + 1} - Light](screenshots/${step.screenshotId}.webp)`);
-      }
-      lines.push('');
-    }
-    if (step.altScreenshotId) {
-      if (inline) {
-        const b64 = await loadScreenshotBase64(step.altScreenshotId);
-        if (b64) {
-          lines.push(`![Step ${i + 1} - Dark](${b64})`);
-        }
-      } else {
-        lines.push(`![Step ${i + 1} - Dark](screenshots/${step.altScreenshotId}.webp)`);
-      }
-      lines.push('');
-    }
-  }
-
-  return lines.join('\n');
-}
-
-export async function exportHtml(data: ExportData, inline = true): Promise<string> {
-  const stepsHtml: string[] = [];
-
-  for (let i = 0; i < data.steps.length; i++) {
-    const step = data.steps[i];
-    let imgTag = '';
-
-    if (step.screenshotId) {
-      if (inline) {
-        const b64 = await loadScreenshotBase64(step.screenshotId);
-        if (b64) {
-          imgTag = `<img src="${b64}" alt="Step ${i + 1}" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px;margin:12px 0;" />`;
-        }
-      } else {
-        imgTag = `<img src="screenshots/${step.screenshotId}.webp" alt="Step ${i + 1}" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px;margin:12px 0;" />`;
-      }
-    }
-
-    stepsHtml.push(`
-      <div style="margin-bottom:32px;">
-        <h2 style="font-size:1.2em;margin-bottom:8px;">Step ${i + 1}: ${escapeHtml(step.title)}</h2>
-        ${step.description ? `<p style="color:#4a5568;margin-bottom:8px;">${escapeHtml(step.description)}</p>` : ''}
-        ${imgTag}
-      </div>
-    `);
-  }
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>${escapeHtml(data.session.title)}</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      max-width: 800px;
-      margin: 0 auto;
-      padding: 40px 20px;
-      color: #1a202c;
-      line-height: 1.6;
-    }
-    h1 { font-size: 1.8em; margin-bottom: 4px; }
-    .meta { color: #718096; font-size: 0.9em; margin-bottom: 24px; }
-    hr { border: none; border-top: 1px solid #e2e8f0; margin: 24px 0; }
-    @media print {
-      body { padding: 20px; }
-      div { break-inside: avoid; }
-    }
-  </style>
-</head>
-<body>
-  <h1>${escapeHtml(data.session.title)}</h1>
-  <p class="meta">
-    Recorded from <a href="${escapeHtml(data.session.startUrl)}">${escapeHtml(data.session.startUrl)}</a><br/>
-    Date: ${new Date(data.session.createdAt).toLocaleDateString()}
-  </p>
-  <hr />
-  ${stepsHtml.join('\n')}
-</body>
-</html>`;
-}
-
-export async function exportZip(
-  data: ExportData,
-  format: 'markdown' | 'html'
-): Promise<Buffer> {
+export async function exportZip(data: ExportData): Promise<Buffer> {
   const mainImageNameByStep = new Map<number, string>();
   const altImageNameByStep = new Map<number, string>();
   const totalSteps = data.steps.length;
@@ -151,9 +23,7 @@ export async function exportZip(
     if (data.steps[i].altScreenshotId) altImageNameByStep.set(i, `step${stepLabel}-dark.webp`);
   }
 
-  const content = format === 'markdown'
-    ? buildMarkdownForZip(data, mainImageNameByStep, altImageNameByStep)
-    : await exportHtml(data, false);
+  const content = buildMarkdownForZip(data, mainImageNameByStep, altImageNameByStep);
 
   const idToZipName = new Map<string, string>();
   for (let i = 0; i < data.steps.length; i++) {
@@ -187,8 +57,7 @@ export async function exportZip(
 
     archive.pipe(writable);
 
-    const ext = format === 'markdown' ? 'md' : 'html';
-    archive.append(content, { name: `documentation.${ext}` });
+    archive.append(content, { name: 'documentation.md' });
 
     // Add screenshot files with friendly names (step01-light.webp / step01-dark.webp).
     for (const row of screenshotRows) {
@@ -244,12 +113,4 @@ function buildMarkdownForZip(
   }
 
   return lines.join('\n');
-}
-
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
 }

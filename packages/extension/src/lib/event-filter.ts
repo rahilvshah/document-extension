@@ -22,10 +22,6 @@ export function isDuplicateClick(selector: string, timestamp: number): boolean {
   return false;
 }
 
-export function isRecentClick(timestamp: number): boolean {
-  return timestamp - lastClickTime < DOUBLE_CLICK_MS;
-}
-
 export function debounceInput(
   event: RecordedEvent,
   selector: string,

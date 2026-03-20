@@ -79,6 +79,7 @@ let batchTimer: ReturnType<typeof setInterval> | null = null;
 let activeTabId: number | null = null;
 let flushing = false;
 const pendingCaptures = new Set<Promise<void>>();
+const domEditStore = new Map<string, string>();
 
 function getState(): RecordingState {
   return { ...state };
@@ -512,7 +513,8 @@ async function waitForPendingCaptures() {
     await new Promise((r) => setTimeout(r, 100));
   }
   if (pendingCaptures.size > 0) {
-    await Promise.allSettled([...pendingCaptures]);
+    const timeout = new Promise<void>((r) => setTimeout(r, 15_000));
+    await Promise.race([Promise.allSettled([...pendingCaptures]), timeout]);
   }
 }
 
@@ -531,7 +533,7 @@ async function startRecording(tab: chrome.tabs.Tab) {
     state = { ...defaultState(), isRecording: true, sessionId: `local-${Date.now()}`, startedAt: Date.now() };
   }
 
-  await clearAll();
+  try { await clearAll(); } catch (err) { console.warn('[docext] IDB clearAll failed:', err); }
   pendingCaptures.clear();
 
   if (activeTabId) {
@@ -616,6 +618,7 @@ async function stopRecording() {
 
   state = defaultState();
   pendingCaptures.clear();
+  domEditStore.clear();
   broadcastState();
 
   return sessionId;
@@ -753,6 +756,11 @@ chrome.runtime.onMessage.addListener(
           await setEmulatedTheme(theme);
           return getState();
         }
+        case 'PERSIST_EDIT': {
+          const { selector, text } = message.payload as { selector: string; text: string };
+          domEditStore.set(selector, text);
+          return { ok: true };
+        }
         default:
           return { error: 'Unknown message type' };
       }
@@ -782,6 +790,14 @@ function injectAndStart(tabId: number, allFrames: boolean, frameIds?: number[]) 
         type: 'START_RECORDING',
         payload: getState(),
       } as ExtensionMessage).catch(() => {});
+
+      if (domEditStore.size > 0) {
+        const edits = Object.fromEntries(domEditStore);
+        chrome.tabs.sendMessage(tabId, {
+          type: 'APPLY_EDITS',
+          payload: edits,
+        } as ExtensionMessage).catch(() => {});
+      }
     }, 50);
   }).catch(() => {});
 }
@@ -798,5 +814,11 @@ chrome.webNavigation?.onDOMContentLoaded?.addListener((details) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (state.isRecording && tabId === activeTabId && changeInfo.status === 'complete') {
     injectAndStart(tabId, true);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (state.isRecording && tabId === activeTabId) {
+    stopRecording().catch((err) => console.warn('[docext] Cleanup on tab close failed:', err));
   }
 });

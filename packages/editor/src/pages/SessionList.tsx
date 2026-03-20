@@ -16,6 +16,7 @@ export default function SessionList() {
   const deleteMutation = useMutation({
     mutationFn: deleteSession,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['sessions'] }),
+    onError: (err) => console.error('Delete session failed:', err),
   });
 
   if (isLoading) {

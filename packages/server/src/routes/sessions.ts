@@ -243,35 +243,34 @@ sessionsRouter.post('/:id/finalize', async (req, res) => {
   }
 });
 
-// Update steps (reorder, edit text, delete) — batch operations
 sessionsRouter.put('/:id/steps', async (req, res) => {
   try {
     const { steps, deletedStepIds } = req.body as UpdateStepsRequest;
 
-    // Batch delete with inArray
-    if (deletedStepIds && deletedStepIds.length > 0) {
-      await db.delete(schema.steps).where(inArray(schema.steps.id, deletedStepIds));
-    }
-
-    // Batch updates (still individual but unavoidable without raw SQL)
-    if (steps && steps.length > 0) {
-      for (const step of steps) {
-        await db
-          .update(schema.steps)
-          .set({
-            sortOrder: step.sortOrder,
-            title: step.title,
-            description: step.description,
-            isEdited: true,
-          })
-          .where(eq(schema.steps.id, step.id));
+    await db.transaction(async (tx) => {
+      if (deletedStepIds && deletedStepIds.length > 0) {
+        await tx.delete(schema.steps).where(inArray(schema.steps.id, deletedStepIds));
       }
-    }
 
-    await db
-      .update(schema.sessions)
-      .set({ updatedAt: Date.now() })
-      .where(eq(schema.sessions.id, req.params.id));
+      if (steps && steps.length > 0) {
+        for (const step of steps) {
+          await tx
+            .update(schema.steps)
+            .set({
+              sortOrder: step.sortOrder,
+              title: step.title,
+              description: step.description,
+              isEdited: true,
+            })
+            .where(eq(schema.steps.id, step.id));
+        }
+      }
+
+      await tx
+        .update(schema.sessions)
+        .set({ updatedAt: Date.now() })
+        .where(eq(schema.sessions.id, req.params.id));
+    });
 
     const updatedSteps = await db
       .select()

@@ -71,12 +71,15 @@ let lastPointerCapture: {
 } | null = null;
 
 // DOM edit mode state
-let domSnapshot: WeakMap<Node, string> = new WeakMap();
-let activeEditable: HTMLElement | null = null;
+let activeEditTarget: HTMLElement | null = null;
+let editOriginalText = '';
+let editOverlayHost: HTMLElement | null = null;
+let editOverlayShadow: ShadowRoot | null = null;
 let domEdits: DomEdit[] = [];
 
 const persistedEdits: Map<string, string> = new Map();
 let editGuardObserver: MutationObserver | null = null;
+let editGuardTimer: ReturnType<typeof setTimeout> | null = null;
 let applyingEdits = false;
 
 // Floating toolbar
@@ -106,12 +109,18 @@ function applyPersistedEdits() {
 function startEditGuard() {
   if (editGuardObserver) return;
   editGuardObserver = new MutationObserver(() => {
-    if (!applyingEdits) applyPersistedEdits();
+    if (applyingEdits) return;
+    if (editGuardTimer) clearTimeout(editGuardTimer);
+    editGuardTimer = setTimeout(applyPersistedEdits, 100);
   });
-  editGuardObserver.observe(document.body, { childList: true, subtree: true });
+  editGuardObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
 }
 
 function stopEditGuard() {
+  if (editGuardTimer) {
+    clearTimeout(editGuardTimer);
+    editGuardTimer = null;
+  }
   if (editGuardObserver) {
     editGuardObserver.disconnect();
     editGuardObserver = null;
@@ -549,8 +558,8 @@ function handlePointerdown(e: PointerEvent) {
 
   if (needsPrevent) {
     promise
-      .then(() => { lastClickSentAt = Date.now(); replayFullChain(target, e); })
-      .catch(() => { lastClickSentAt = Date.now(); replayFullChain(target, e); });
+      .then(() => { lastClickSentAt = Date.now(); if (target.isConnected) replayFullChain(target, e); })
+      .catch(() => { lastClickSentAt = Date.now(); if (target.isConnected) replayFullChain(target, e); });
   }
 }
 
@@ -561,11 +570,15 @@ function handleClick(e: MouseEvent) {
   if (!rawTarget || (toolbarHost && toolbarHost.contains(rawTarget))) return;
 
   const target = resolveClickTarget(rawTarget);
-  if (!target) return;
-
   const now = Date.now();
 
-  if (lastPointerCapture && now - lastPointerCapture.time < 800) {
+  if (lastPointerCapture && now - lastPointerCapture.time >= 800) {
+    lastPointerCapture = null;
+  }
+
+  if (!target) return;
+
+  if (lastPointerCapture) {
     e.preventDefault();
     e.stopPropagation();
 
@@ -576,6 +589,7 @@ function handleClick(e: MouseEvent) {
 
     const capture = lastPointerCapture;
     lastPointerCapture = null;
+    if (!target.isConnected) return;
     capture.promise
       .then(() => { lastClickSentAt = Date.now(); replayClick(target); })
       .catch(() => { lastClickSentAt = Date.now(); replayClick(target); });
@@ -584,7 +598,6 @@ function handleClick(e: MouseEvent) {
 
   if (capturePaused) return;
 
-  lastPointerCapture = null;
   const info = resolveElement(target);
   if (isDuplicateClick(info.selector, now)) return;
 
@@ -594,10 +607,10 @@ function handleClick(e: MouseEvent) {
   e.preventDefault();
   e.stopPropagation();
 
-  const replayTarget = target;
+  if (!target.isConnected) return;
   safeSendMessage({ type: 'EVENT_CAPTURED', payload: capturedEvent })
-    .then(() => { lastClickSentAt = Date.now(); replayClick(replayTarget); })
-    .catch(() => { lastClickSentAt = Date.now(); replayClick(replayTarget); });
+    .then(() => { lastClickSentAt = Date.now(); replayClick(target); })
+    .catch(() => { lastClickSentAt = Date.now(); replayClick(target); });
 }
 
 function handleBlur(e: FocusEvent) {
@@ -880,52 +893,133 @@ function stopToolbarTimer() {
   }
 }
 
-// ── Edit Mode ──
+// ── Edit Mode (Overlay Textarea) ──
+// Uses a floating textarea inside a Shadow DOM overlay instead of
+// contentEditable on framework-managed DOM elements. This avoids
+// infinite mutation loops between the framework reconciler and the
+// edit guard observer.
 
-function enterEditMode() {
-  editMode = true;
-  domSnapshot = new WeakMap();
-
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  while (walker.nextNode()) {
-    domSnapshot.set(walker.currentNode, walker.currentNode.textContent || '');
-  }
-  document.addEventListener('click', handleEditClick, true);
-  document.addEventListener('keydown', handleEditKeydown, true);
-}
-
-function handleEditKeydown(e: KeyboardEvent) {
-  if (!editMode || !activeEditable) return;
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    commitActiveEditable();
-  }
-  if (e.key === 'Escape') {
-    e.preventDefault();
-    if (activeEditable.firstChild && domSnapshot.has(activeEditable.firstChild)) {
-      activeEditable.textContent = domSnapshot.get(activeEditable.firstChild)!;
+function createEditOverlay() {
+  if (editOverlayHost) return;
+  editOverlayHost = document.createElement('div');
+  editOverlayHost.id = 'docext-edit-overlay';
+  editOverlayHost.style.cssText =
+    'position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none;';
+  editOverlayShadow = editOverlayHost.attachShadow({ mode: 'open' });
+  editOverlayShadow.innerHTML = `<style>
+    :host { all: initial; }
+    .edit-ta {
+      position: fixed;
+      pointer-events: auto;
+      border: 2px solid #6366f1;
+      border-radius: 4px;
+      background: #fff;
+      color: #1e293b;
+      padding: 4px 6px;
+      resize: both;
+      outline: none;
+      z-index: 2147483647;
+      overflow: auto;
+      box-shadow: 0 4px 16px rgba(99,102,241,0.18);
+      white-space: pre-wrap;
+      word-break: break-word;
     }
-    activeEditable.contentEditable = 'false';
-    activeEditable.style.outline = '';
-    activeEditable = null;
+  </style>`;
+  document.documentElement.appendChild(editOverlayHost);
+}
+
+function destroyEditOverlay() {
+  if (editOverlayHost) {
+    editOverlayHost.remove();
+    editOverlayHost = null;
+    editOverlayShadow = null;
   }
 }
 
-function commitActiveEditable() {
-  if (!activeEditable) return;
-  const info = resolveElement(activeEditable);
-  const original = (activeEditable.firstChild ? domSnapshot.get(activeEditable.firstChild) : null) || '';
-  const modified = activeEditable.textContent || '';
-  if (original !== modified) {
+function commitActiveEdit() {
+  if (!activeEditTarget || !editOverlayShadow) return;
+  const ta = editOverlayShadow.querySelector('.edit-ta') as HTMLTextAreaElement | null;
+  if (!ta) { activeEditTarget = null; return; }
+
+  const info = resolveElement(activeEditTarget);
+  const original = editOriginalText;
+  const modified = ta.value;
+
+  if (original !== modified && modified.length > 0) {
+    applyingEdits = true;
+    try {
+      activeEditTarget.textContent = modified;
+    } finally {
+      applyingEdits = false;
+    }
     domEdits.push({ selector: info.selector, original, modified });
     persistedEdits.set(info.selector, modified);
-    if (activeEditable.firstChild) {
-      domSnapshot.set(activeEditable.firstChild, modified);
-    }
+    safeSendMessage({ type: 'PERSIST_EDIT', payload: { selector: info.selector, text: modified } });
   }
-  activeEditable.contentEditable = 'false';
-  activeEditable.style.outline = '';
-  activeEditable = null;
+
+  activeEditTarget.style.outline = '';
+  activeEditTarget = null;
+  editOriginalText = '';
+  ta.remove();
+}
+
+function cancelActiveEdit() {
+  if (!activeEditTarget) return;
+  activeEditTarget.style.outline = '';
+  activeEditTarget = null;
+  editOriginalText = '';
+  if (editOverlayShadow) {
+    const ta = editOverlayShadow.querySelector('.edit-ta');
+    if (ta) ta.remove();
+  }
+}
+
+function openEditTextarea(target: HTMLElement) {
+  if (!editOverlayShadow) return;
+
+  const prev = editOverlayShadow.querySelector('.edit-ta');
+  if (prev) prev.remove();
+
+  const rect = target.getBoundingClientRect();
+  let cs: CSSStyleDeclaration;
+  try { cs = getComputedStyle(target); } catch { return; }
+
+  editOriginalText = target.textContent || '';
+
+  const ta = document.createElement('textarea');
+  ta.className = 'edit-ta';
+  ta.value = editOriginalText;
+  ta.style.left = `${rect.left}px`;
+  ta.style.top = `${rect.top}px`;
+  ta.style.width = `${Math.max(rect.width + 24, 140)}px`;
+  ta.style.height = `${Math.max(rect.height + 12, 44)}px`;
+  ta.style.fontSize = cs.fontSize;
+  ta.style.fontFamily = cs.fontFamily;
+  ta.style.fontWeight = cs.fontWeight;
+  ta.style.lineHeight = cs.lineHeight;
+  ta.style.letterSpacing = cs.letterSpacing;
+
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      commitActiveEdit();
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelActiveEdit();
+    }
+  });
+  ta.addEventListener('click', (e) => e.stopPropagation());
+  ta.addEventListener('pointerdown', (e) => e.stopPropagation());
+
+  editOverlayShadow.appendChild(ta);
+  requestAnimationFrame(() => { ta.focus(); ta.select(); });
+
+  activeEditTarget = target;
+  target.style.outline = '2px dashed #6366f1';
 }
 
 const TEXT_LEAF_TAGS = new Set([
@@ -959,34 +1053,37 @@ function handleEditClick(e: MouseEvent) {
   if (!editMode) return;
   const clicked = e.target as HTMLElement;
   if (!clicked) return;
-  if (toolbarHost && (toolbarHost.contains(clicked) || clicked === toolbarHost)) return;
+  if (toolbarHost && toolbarHost.contains(clicked)) return;
+  if (editOverlayHost && editOverlayHost.contains(clicked)) return;
 
   e.preventDefault();
   e.stopPropagation();
 
+  if (activeEditTarget) {
+    commitActiveEdit();
+  }
+
   const target = findTextTarget(e.clientX, e.clientY, clicked);
   if (!target) return;
 
-  if (activeEditable && activeEditable !== target) {
-    commitActiveEditable();
-  }
+  openEditTextarea(target);
+}
 
-  target.contentEditable = 'true';
-  target.style.outline = '2px solid #6366f1';
-  target.focus();
-  activeEditable = target;
+function enterEditMode() {
+  editMode = true;
+  createEditOverlay();
+  document.addEventListener('click', handleEditClick, true);
 }
 
 function exitEditMode() {
   editMode = false;
 
-  if (activeEditable) {
-    commitActiveEditable();
+  if (activeEditTarget) {
+    commitActiveEdit();
   }
 
-  domSnapshot = new WeakMap();
+  destroyEditOverlay();
   document.removeEventListener('click', handleEditClick, true);
-  document.removeEventListener('keydown', handleEditKeydown, true);
 }
 
 // ── Start/Stop Recording ──
@@ -1026,6 +1123,7 @@ function stopRecording() {
   if (isTopFrame) {
     stopEditGuard();
     if (editMode) exitEditMode();
+    destroyEditOverlay();
   }
 
   lastPointerCapture = null;
@@ -1121,6 +1219,17 @@ function messageHandler(message: ExtensionMessage, _sender: chrome.runtime.Messa
       if (toolbarHost) toolbarHost.style.display = '';
       sendResponse({ ok: true });
       break;
+    case 'APPLY_EDITS': {
+      const edits = message.payload as Record<string, string> | undefined;
+      if (edits) {
+        for (const [selector, text] of Object.entries(edits)) {
+          persistedEdits.set(selector, text);
+        }
+        setTimeout(applyPersistedEdits, 200);
+      }
+      sendResponse({ ok: true });
+      break;
+    }
     case 'GET_STATE':
       sendResponse({ isRecording, editMode });
       break;

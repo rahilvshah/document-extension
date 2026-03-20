@@ -50,6 +50,9 @@ export default function SessionEditor() {
   const serverSteps = data?.steps ?? [];
   const steps = localSteps ?? serverSteps;
 
+  const stepsRef = useRef(steps);
+  stepsRef.current = steps;
+
   const pendingStepsRef = useRef<{ steps: Step[]; deletedStepIds?: string[] } | null>(null);
 
   const updateMutation = useMutation({
@@ -95,6 +98,10 @@ export default function SessionEditor() {
   const deleteMutation = useMutation({
     mutationFn: () => deleteSession(id!),
     onSuccess: () => navigate('/'),
+    onError: (err) => {
+      console.error('Delete failed:', err);
+      setSaveError('Failed to delete session');
+    },
   });
 
   const sensors = useSensors(
@@ -102,13 +109,12 @@ export default function SessionEditor() {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
 
-  // Stable callbacks that don't change on every render
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
       const { active, over } = event;
       if (!over || active.id === over.id) return;
 
-      const currentSteps = pendingStepsRef.current?.steps ?? localSteps ?? serverSteps;
+      const currentSteps = stepsRef.current;
       const oldIndex = currentSteps.findIndex((s) => s.id === active.id);
       const newIndex = currentSteps.findIndex((s) => s.id === over.id);
       if (oldIndex === -1 || newIndex === -1) return;
@@ -119,27 +125,25 @@ export default function SessionEditor() {
 
       flushUpdate({ steps: reordered });
     },
-    [localSteps, serverSteps, flushUpdate]
+    [flushUpdate]
   );
 
   const handleStepUpdate = useCallback(
     (stepId: string, field: 'title' | 'description', value: string) => {
-      const currentSteps = pendingStepsRef.current?.steps ?? localSteps ?? serverSteps;
-      const updated = currentSteps.map((s) =>
+      const updated = stepsRef.current.map((s) =>
         s.id === stepId ? { ...s, [field]: value } : s
       );
       flushUpdate({ steps: updated });
     },
-    [localSteps, serverSteps, flushUpdate]
+    [flushUpdate]
   );
 
   const handleStepDelete = useCallback(
     (stepId: string) => {
-      const currentSteps = pendingStepsRef.current?.steps ?? localSteps ?? serverSteps;
-      const remaining = currentSteps.filter((s) => s.id !== stepId);
+      const remaining = stepsRef.current.filter((s) => s.id !== stepId);
       flushUpdate({ steps: remaining, deletedStepIds: [stepId] });
     },
-    [localSteps, serverSteps, flushUpdate]
+    [flushUpdate]
   );
 
   const handleScreenshotClick = useCallback(

@@ -47,16 +47,6 @@ function locationHint(meta: { containerRole?: string; sectionLabel?: string; nea
   return '';
 }
 
-function describeUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    const path = u.pathname === '/' ? '' : u.pathname;
-    return `${u.hostname}${path}`;
-  } catch {
-    return url;
-  }
-}
-
 const SENSITIVE_FIELDS = /password|secret|token|ssn|credit.?card|cvv|pin|social.?security/i;
 
 function bestLabel(m: ClickMeta): string {
@@ -275,12 +265,11 @@ export function generateSteps(
     if (primaryEvent.type === 'input') {
       const lastMeta = (group[group.length - 1].metadata as InputMeta);
       const finalValue = lastMeta.value || (primaryEvent.metadata as InputMeta).value || '';
-      if (finalValue.length <= 2 && finalValue !== '') { prevEvent = primaryEvent; continue; }
+      if (finalValue.length === 0) { prevEvent = primaryEvent; continue; }
     }
 
     if (primaryEvent.type === 'modal' && (primaryEvent.metadata as ModalMeta).action === 'open') {
       if (prevEvent && prevEvent.type === 'click') {
-        prevEvent = primaryEvent;
         continue;
       }
     }
