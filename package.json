@@ -1,0 +1,26 @@
+{
+  "name": "document-extension",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/shared",
+    "packages/server",
+    "packages/extension",
+    "packages/editor"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w packages/server",
+    "build": "npm run build -w packages/shared && concurrently \"npm run build -w packages/server\" \"npm run build -w packages/extension\" \"npm run build -w packages/editor\"",
+    "build:extension": "npm run build -w packages/extension",
+    "build:editor": "npm run build -w packages/editor",
+    "build:server": "npm run build -w packages/server"
+  },
+  "overrides": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.7.0"
+  }
+}

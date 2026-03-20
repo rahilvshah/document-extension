@@ -1,0 +1,209 @@
+// ── Event Types ──
+
+export type RecordedEventType =
+  | 'click'
+  | 'input'
+  | 'select'
+  | 'navigate'
+  | 'submit'
+  | 'modal';
+
+export interface ClickMeta {
+  elementTag: string;
+  elementText: string;
+  ariaLabel?: string;
+  role?: string;
+  selector: string;
+  coordinates: { x: number; y: number };
+  elementRect?: { x: number; y: number; width: number; height: number };
+  cropRect?: { x: number; y: number; width: number; height: number };
+  viewportSize?: { width: number; height: number };
+  nearestHeading?: string;
+  sectionLabel?: string;
+  containerRole?: string;
+  href?: string;
+  title?: string;
+  parentText?: string;
+  fieldLabel?: string;
+  breadcrumb?: string;
+  tooltipText?: string;
+  inputValue?: string;
+}
+
+export interface InputMeta {
+  fieldLabel: string;
+  fieldType: string;
+  value: string;
+  selector: string;
+  placeholder?: string;
+  nearestHeading?: string;
+  sectionLabel?: string;
+  containerRole?: string;
+  breadcrumb?: string;
+  elementRect?: { x: number; y: number; width: number; height: number };
+  cropRect?: { x: number; y: number; width: number; height: number };
+  viewportSize?: { width: number; height: number };
+}
+
+export interface SelectMeta {
+  fieldLabel: string;
+  selectedOption: string;
+  selector: string;
+  nearestHeading?: string;
+  sectionLabel?: string;
+  breadcrumb?: string;
+  elementRect?: { x: number; y: number; width: number; height: number };
+  cropRect?: { x: number; y: number; width: number; height: number };
+  viewportSize?: { width: number; height: number };
+}
+
+export interface NavigateMeta {
+  fromUrl: string;
+  toUrl: string;
+  newTitle: string;
+}
+
+export interface SubmitMeta {
+  formName?: string;
+  formAction?: string;
+  fieldCount: number;
+  nearestHeading?: string;
+}
+
+export interface ModalMeta {
+  action: 'open' | 'close';
+  dialogText?: string;
+  selector?: string;
+  nearestHeading?: string;
+}
+
+export type EventMetadata =
+  | ClickMeta
+  | InputMeta
+  | SelectMeta
+  | NavigateMeta
+  | SubmitMeta
+  | ModalMeta;
+
+export interface DomEdit {
+  selector: string;
+  original: string;
+  modified: string;
+}
+
+export interface RecordedEvent {
+  id: string;
+  type: RecordedEventType;
+  timestamp: number;
+  url: string;
+  pageTitle: string;
+  screenshotId?: string;
+  altScreenshotId?: string;
+  metadata: EventMetadata;
+  domEdits?: DomEdit[];
+}
+
+// ── Session ──
+
+export interface Session {
+  id: string;
+  title: string;
+  startUrl: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SessionWithSteps extends Session {
+  steps: Step[];
+}
+
+// ── Step ──
+
+export interface Step {
+  id: string;
+  sessionId: string;
+  sortOrder: number;
+  title: string;
+  description: string;
+  screenshotId?: string;
+  altScreenshotId?: string;
+  sourceEventIds: string[];
+  isEdited: boolean;
+}
+
+// ── Screenshot ──
+
+export interface Screenshot {
+  id: string;
+  sessionId: string;
+  filePath: string;
+  createdAt: number;
+}
+
+// ── API Request/Response Shapes ──
+
+export interface CreateSessionRequest {
+  title?: string;
+  startUrl: string;
+}
+
+export interface CreateSessionResponse {
+  session: Session;
+}
+
+export interface BatchEventsRequest {
+  events: RecordedEvent[];
+}
+
+export interface UploadScreenshotResponse {
+  screenshotId: string;
+}
+
+export interface FinalizeSessionResponse {
+  steps: Step[];
+}
+
+export interface UpdateStepsRequest {
+  steps: Array<{
+    id: string;
+    sortOrder: number;
+    title: string;
+    description: string;
+  }>;
+  deletedStepIds?: string[];
+}
+
+export interface ExportFormat {
+  format: 'markdown' | 'html';
+  inline?: boolean; // base64 inline images vs zip with files
+}
+
+// ── Extension Messages ──
+
+export type ExtensionMessageType =
+  | 'START_RECORDING'
+  | 'STOP_RECORDING'
+  | 'RECORDING_STATE'
+  | 'EVENT_CAPTURED'
+  | 'ENTER_EDIT_MODE'
+  | 'EXIT_EDIT_MODE'
+  | 'TOGGLE_THEME'
+  | 'PAUSE_CAPTURE'
+  | 'RESUME_CAPTURE'
+  | 'HIDE_TOOLBAR'
+  | 'SHOW_TOOLBAR'
+  | 'GET_STATE';
+
+export interface ExtensionMessage {
+  type: ExtensionMessageType;
+  payload?: unknown;
+}
+
+export interface RecordingState {
+  isRecording: boolean;
+  sessionId: string | null;
+  eventCount: number;
+  startedAt: number | null;
+  editMode: boolean;
+  theme: 'system' | 'light' | 'dark';
+}
