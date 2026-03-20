@@ -7,7 +7,7 @@ const logoSvg28 = getLogoSvgMarkup(28);
 const EDITOR_URL = 'http://localhost:3001';
 
 function sendMessage(msg: ExtensionMessage): Promise<any> {
-  return chrome.runtime.sendMessage(msg);
+  return chrome.runtime.sendMessage(msg).catch(() => null);
 }
 
 function formatTime(ms: number): string {

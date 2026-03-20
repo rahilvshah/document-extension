@@ -51,6 +51,7 @@ export interface SelectMeta {
   selector: string;
   nearestHeading?: string;
   sectionLabel?: string;
+  containerRole?: string;
   breadcrumb?: string;
   elementRect?: { x: number; y: number; width: number; height: number };
   cropRect?: { x: number; y: number; width: number; height: number };
@@ -127,15 +128,6 @@ export interface Step {
   isEdited: boolean;
 }
 
-// ── Screenshot ──
-
-export interface Screenshot {
-  id: string;
-  sessionId: string;
-  filePath: string;
-  createdAt: number;
-}
-
 // ── API Request/Response Shapes ──
 
 export interface CreateSessionRequest {
@@ -143,20 +135,8 @@ export interface CreateSessionRequest {
   startUrl: string;
 }
 
-export interface CreateSessionResponse {
-  session: Session;
-}
-
 export interface BatchEventsRequest {
   events: RecordedEvent[];
-}
-
-export interface UploadScreenshotResponse {
-  screenshotId: string;
-}
-
-export interface FinalizeSessionResponse {
-  steps: Step[];
 }
 
 export interface UpdateStepsRequest {
@@ -183,9 +163,7 @@ export type ExtensionMessageType =
   | 'RESUME_CAPTURE'
   | 'HIDE_TOOLBAR'
   | 'SHOW_TOOLBAR'
-  | 'GET_STATE'
-  | 'PERSIST_EDIT'
-  | 'APPLY_EDITS';
+  | 'GET_STATE';
 
 export interface ExtensionMessage {
   type: ExtensionMessageType;

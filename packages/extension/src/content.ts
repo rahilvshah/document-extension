@@ -10,7 +10,7 @@ import type {
   DomEdit,
   ExtensionMessage,
 } from '@docext/shared';
-import { resolveElement, isInteractiveElement, isStrongInteractive, type ElementInfo } from './lib/element-resolver.js';
+import { resolveElement, buildSelector, isInteractiveElement, isStrongInteractive, type ElementInfo } from './lib/element-resolver.js';
 import {
   isDuplicateClick,
   debounceInput,
@@ -19,8 +19,10 @@ import {
   resetFilters,
 } from './lib/event-filter.js';
 
+const SENSITIVE_RE = /password|secret|token|ssn|credit.?card|cvv|pin|social.?security/i;
+
 const LOGO_SVG_HTML = `
-  <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" focusable="false" style="display:block">
+  <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" focusable="false" style="display:block">
     <circle cx="12" cy="12" r="10" fill="#6366f1"></circle>
     <path
       d="M9 7.5h4a4.5 4.5 0 0 1 0 9H9"
@@ -71,16 +73,20 @@ let lastPointerCapture: {
 } | null = null;
 
 // DOM edit mode state
-let activeEditTarget: HTMLElement | null = null;
-let editOriginalText = '';
-let editOverlayHost: HTMLElement | null = null;
-let editOverlayShadow: ShadowRoot | null = null;
+let domSnapshot: WeakMap<Node, string> = new WeakMap();
+let activeEditable: HTMLElement | null = null;
 let domEdits: DomEdit[] = [];
 
-const persistedEdits: Map<string, string> = new Map();
+interface PersistedEdit {
+  original: string;
+  modified: string;
+  tag: string;
+}
+
+const persistedEdits: Map<string, PersistedEdit> = new Map();
 let editGuardObserver: MutationObserver | null = null;
-let editGuardTimer: ReturnType<typeof setTimeout> | null = null;
 let applyingEdits = false;
+let editGuardDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Floating toolbar
 let toolbarHost: HTMLElement | null = null;
@@ -89,43 +95,120 @@ let toolbarTimer: ReturnType<typeof setInterval> | null = null;
 
 // ── Persistent Edit Guard ──
 
+const EDIT_GUARD_DEBOUNCE_MS = 400;
+
+function findElementByOriginalText(edit: PersistedEdit): Element | null {
+  try {
+    const candidates = document.querySelectorAll(edit.tag);
+    for (const el of candidates) {
+      if (el === activeEditable || el.contains(activeEditable!)) continue;
+      const text = (el.textContent || '').trim();
+      if (text === edit.original.trim()) return el;
+    }
+  } catch { /* DOM traversal error */ }
+  return null;
+}
+
 function applyPersistedEdits() {
   if (persistedEdits.size === 0 || applyingEdits) return;
   applyingEdits = true;
   try {
-    for (const [selector, text] of persistedEdits) {
+    const selectorUpdates: [string, string, PersistedEdit][] = [];
+
+    for (const [selector, edit] of persistedEdits) {
       try {
-        const el = document.querySelector(selector);
-        if (el && el.textContent !== text) {
-          el.textContent = text;
+        let el = document.querySelector(selector);
+
+        if (el && (el === activeEditable || el.contains(activeEditable!))) continue;
+
+        if (!el || (el.textContent || '').trim() === edit.modified.trim()) {
+          if (el) continue;
+          el = findElementByOriginalText(edit);
+          if (!el) continue;
+          const newSelector = buildSelector(el);
+          if (newSelector !== selector) {
+            selectorUpdates.push([selector, newSelector, edit]);
+          }
         }
-      } catch { /* invalid selector */ }
+
+        if (el.textContent !== edit.modified) {
+          el.textContent = edit.modified;
+        }
+      } catch { /* invalid selector or DOM error */ }
     }
+
+    for (const [oldSel, newSel, edit] of selectorUpdates) {
+      persistedEdits.delete(oldSel);
+      persistedEdits.set(newSel, edit);
+    }
+    if (selectorUpdates.length > 0) saveEditsToStorage();
   } finally {
     applyingEdits = false;
   }
 }
 
+function scheduleEditGuard(immediate: boolean) {
+  if (immediate) {
+    if (editGuardDebounceTimer) clearTimeout(editGuardDebounceTimer);
+    editGuardDebounceTimer = null;
+    if (!applyingEdits && !activeEditable) applyPersistedEdits();
+    return;
+  }
+  if (editGuardDebounceTimer) clearTimeout(editGuardDebounceTimer);
+  editGuardDebounceTimer = setTimeout(() => {
+    editGuardDebounceTimer = null;
+    if (!applyingEdits && !activeEditable) applyPersistedEdits();
+  }, EDIT_GUARD_DEBOUNCE_MS);
+}
+
 function startEditGuard() {
   if (editGuardObserver) return;
-  editGuardObserver = new MutationObserver(() => {
+  editGuardObserver = new MutationObserver((mutations) => {
     if (applyingEdits) return;
-    if (editGuardTimer) clearTimeout(editGuardTimer);
-    editGuardTimer = setTimeout(applyPersistedEdits, 100);
+    let hasNewNodes = false;
+    for (const m of mutations) {
+      if (m.addedNodes.length > 0) { hasNewNodes = true; break; }
+    }
+    scheduleEditGuard(hasNewNodes);
   });
-  editGuardObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+  editGuardObserver.observe(document.body, { childList: true, subtree: true });
 }
 
 function stopEditGuard() {
-  if (editGuardTimer) {
-    clearTimeout(editGuardTimer);
-    editGuardTimer = null;
+  if (editGuardDebounceTimer) {
+    clearTimeout(editGuardDebounceTimer);
+    editGuardDebounceTimer = null;
   }
   if (editGuardObserver) {
     editGuardObserver.disconnect();
     editGuardObserver = null;
   }
   persistedEdits.clear();
+  chrome.storage.local.remove('docext_edits').catch(() => {});
+}
+
+function saveEditsToStorage() {
+  if (persistedEdits.size === 0) {
+    chrome.storage.local.remove('docext_edits').catch(() => {});
+    return;
+  }
+  const data: Record<string, { original: string; modified: string; tag: string }> = {};
+  for (const [k, v] of persistedEdits) data[k] = v;
+  chrome.storage.local.set({ docext_edits: data }).catch(() => {});
+}
+
+async function loadEditsFromStorage() {
+  try {
+    const result = await chrome.storage.local.get('docext_edits');
+    const stored = result?.docext_edits as Record<string, PersistedEdit> | undefined;
+    if (!stored) return;
+    for (const [selector, edit] of Object.entries(stored)) {
+      if (edit && edit.original && edit.modified && edit.tag) {
+        persistedEdits.set(selector, edit);
+      }
+    }
+    if (persistedEdits.size > 0) applyPersistedEdits();
+  } catch { /* storage unavailable in some contexts */ }
 }
 
 // ── Crop & Layout Helpers ──
@@ -244,28 +327,30 @@ function findCropContainer(el: Element): DOMRect {
 
 // ── Interactive Element Resolution ──
 
-function findInteractiveAncestor(el: Element): Element | null {
-  let node: Element | null = el;
-  let depth = 0;
-  let weakMatch: Element | null = null;
+const CONTAINER_ROLES = new Set(['menu', 'menubar', 'listbox', 'tablist', 'navigation']);
+const CONTAINER_TAGS = new Set(['menu', 'nav', 'ul', 'ol']);
 
-  const containerRoles = new Set(['menu', 'menubar', 'listbox', 'tablist', 'navigation']);
-  const containerTags = new Set(['menu', 'nav', 'ul', 'ol']);
-  const hasActionableHints = (n: Element) =>
+function hasActionableHints(n: Element): boolean {
+  return (
     n.hasAttribute('aria-haspopup') ||
     n.hasAttribute('onclick') ||
     n.hasAttribute('data-action') ||
     n.getAttribute('role') === 'button' ||
     n.tagName.toLowerCase() === 'button' ||
-    n.tagName.toLowerCase() === 'a';
+    n.tagName.toLowerCase() === 'a'
+  );
+}
+
+function findInteractiveAncestor(el: Element): Element | null {
+  let node: Element | null = el;
+  let depth = 0;
+  let weakMatch: Element | null = null;
 
   while (node && depth < 10) {
     if (isStrongInteractive(node)) {
       const role = node.getAttribute('role');
       const tag = node.tagName.toLowerCase();
-      // Skip focusable containers (e.g. role="menu" with tabindex) so we don't
-      // end up targeting the entire menu/sidebar instead of the actual item.
-      if ((role && containerRoles.has(role)) || containerTags.has(tag)) {
+      if ((role && CONTAINER_ROLES.has(role)) || CONTAINER_TAGS.has(tag)) {
         if (!hasActionableHints(node)) {
           if (!weakMatch && isInteractiveElement(node)) weakMatch = node;
           node = node.parentElement;
@@ -330,8 +415,6 @@ function sendEvent(event: RecordedEvent) {
   if (capturePaused) return;
   safeSendMessage({ type: 'EVENT_CAPTURED', payload: event });
 }
-
-const SENSITIVE_RE = /password|secret|token|ssn|credit.?card|cvv|pin|social.?security/i;
 
 // ── Event Builders ──
 
@@ -414,6 +497,9 @@ function buildSelectEvent(el: HTMLSelectElement, info: ElementInfo): RecordedEve
     fieldLabel: label,
     selectedOption,
     selector: info.selector,
+    nearestHeading: info.nearestHeading,
+    sectionLabel: info.sectionLabel,
+    containerRole: info.containerRole,
     breadcrumb: info.breadcrumb,
     elementRect: { x: r.left, y: r.top, width: r.width, height: r.height },
     cropRect: { x: cr.x, y: cr.y, width: cr.width, height: cr.height },
@@ -558,8 +644,8 @@ function handlePointerdown(e: PointerEvent) {
 
   if (needsPrevent) {
     promise
-      .then(() => { lastClickSentAt = Date.now(); if (target.isConnected) replayFullChain(target, e); })
-      .catch(() => { lastClickSentAt = Date.now(); if (target.isConnected) replayFullChain(target, e); });
+      .then(() => { lastClickSentAt = Date.now(); replayFullChain(target, e); })
+      .catch(() => { lastClickSentAt = Date.now(); replayFullChain(target, e); });
   }
 }
 
@@ -570,15 +656,11 @@ function handleClick(e: MouseEvent) {
   if (!rawTarget || (toolbarHost && toolbarHost.contains(rawTarget))) return;
 
   const target = resolveClickTarget(rawTarget);
-  const now = Date.now();
-
-  if (lastPointerCapture && now - lastPointerCapture.time >= 800) {
-    lastPointerCapture = null;
-  }
-
   if (!target) return;
 
-  if (lastPointerCapture) {
+  const now = Date.now();
+
+  if (lastPointerCapture && now - lastPointerCapture.time < 800) {
     e.preventDefault();
     e.stopPropagation();
 
@@ -589,7 +671,6 @@ function handleClick(e: MouseEvent) {
 
     const capture = lastPointerCapture;
     lastPointerCapture = null;
-    if (!target.isConnected) return;
     capture.promise
       .then(() => { lastClickSentAt = Date.now(); replayClick(target); })
       .catch(() => { lastClickSentAt = Date.now(); replayClick(target); });
@@ -598,6 +679,7 @@ function handleClick(e: MouseEvent) {
 
   if (capturePaused) return;
 
+  lastPointerCapture = null;
   const info = resolveElement(target);
   if (isDuplicateClick(info.selector, now)) return;
 
@@ -607,10 +689,10 @@ function handleClick(e: MouseEvent) {
   e.preventDefault();
   e.stopPropagation();
 
-  if (!target.isConnected) return;
+  const replayTarget = target;
   safeSendMessage({ type: 'EVENT_CAPTURED', payload: capturedEvent })
-    .then(() => { lastClickSentAt = Date.now(); replayClick(target); })
-    .catch(() => { lastClickSentAt = Date.now(); replayClick(target); });
+    .then(() => { lastClickSentAt = Date.now(); replayClick(replayTarget); })
+    .catch(() => { lastClickSentAt = Date.now(); replayClick(replayTarget); });
 }
 
 function handleBlur(e: FocusEvent) {
@@ -771,7 +853,7 @@ function createFloatingToolbar() {
         color: #334155;
         user-select: none;
       }
-      .logo { width: 24px; height: 24px; flex-shrink: 0; }
+      .logo { width: 24px; height: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
       .rec-dot {
         width: 8px; height: 8px;
         border-radius: 50%;
@@ -893,133 +975,58 @@ function stopToolbarTimer() {
   }
 }
 
-// ── Edit Mode (Overlay Textarea) ──
-// Uses a floating textarea inside a Shadow DOM overlay instead of
-// contentEditable on framework-managed DOM elements. This avoids
-// infinite mutation loops between the framework reconciler and the
-// edit guard observer.
+// ── Edit Mode ──
 
-function createEditOverlay() {
-  if (editOverlayHost) return;
-  editOverlayHost = document.createElement('div');
-  editOverlayHost.id = 'docext-edit-overlay';
-  editOverlayHost.style.cssText =
-    'position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none;';
-  editOverlayShadow = editOverlayHost.attachShadow({ mode: 'open' });
-  editOverlayShadow.innerHTML = `<style>
-    :host { all: initial; }
-    .edit-ta {
-      position: fixed;
-      pointer-events: auto;
-      border: 2px solid #6366f1;
-      border-radius: 4px;
-      background: #fff;
-      color: #1e293b;
-      padding: 4px 6px;
-      resize: both;
-      outline: none;
-      z-index: 2147483647;
-      overflow: auto;
-      box-shadow: 0 4px 16px rgba(99,102,241,0.18);
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-  </style>`;
-  document.documentElement.appendChild(editOverlayHost);
+function enterEditMode() {
+  editMode = true;
+  domSnapshot = new WeakMap();
+
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    domSnapshot.set(walker.currentNode, walker.currentNode.textContent || '');
+  }
+  document.addEventListener('click', handleEditClick, true);
+  document.addEventListener('keydown', handleEditKeydown, true);
 }
 
-function destroyEditOverlay() {
-  if (editOverlayHost) {
-    editOverlayHost.remove();
-    editOverlayHost = null;
-    editOverlayShadow = null;
+function handleEditKeydown(e: KeyboardEvent) {
+  if (!editMode || !activeEditable) return;
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    commitActiveEditable();
+    return;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    const el = activeEditable;
+    activeEditable = null;
+    if (el.firstChild && domSnapshot.has(el.firstChild)) {
+      el.textContent = domSnapshot.get(el.firstChild)!;
+    }
+    el.contentEditable = 'false';
+    el.style.outline = '';
   }
 }
 
-function commitActiveEdit() {
-  if (!activeEditTarget || !editOverlayShadow) return;
-  const ta = editOverlayShadow.querySelector('.edit-ta') as HTMLTextAreaElement | null;
-  if (!ta) { activeEditTarget = null; return; }
-
-  const info = resolveElement(activeEditTarget);
-  const original = editOriginalText;
-  const modified = ta.value;
-
-  if (original !== modified && modified.length > 0) {
-    applyingEdits = true;
-    try {
-      activeEditTarget.textContent = modified;
-    } finally {
-      applyingEdits = false;
-    }
+function commitActiveEditable() {
+  if (!activeEditable) return;
+  const el = activeEditable;
+  activeEditable = null;
+  const info = resolveElement(el);
+  const original = (el.firstChild ? domSnapshot.get(el.firstChild) : null) || '';
+  const modified = el.textContent || '';
+  if (original !== modified) {
     domEdits.push({ selector: info.selector, original, modified });
-    persistedEdits.set(info.selector, modified);
-    safeSendMessage({ type: 'PERSIST_EDIT', payload: { selector: info.selector, text: modified } });
+    persistedEdits.set(info.selector, {
+      original,
+      modified,
+      tag: el.tagName.toLowerCase(),
+    });
+    if (el.firstChild) domSnapshot.set(el.firstChild, modified);
+    saveEditsToStorage();
   }
-
-  activeEditTarget.style.outline = '';
-  activeEditTarget = null;
-  editOriginalText = '';
-  ta.remove();
-}
-
-function cancelActiveEdit() {
-  if (!activeEditTarget) return;
-  activeEditTarget.style.outline = '';
-  activeEditTarget = null;
-  editOriginalText = '';
-  if (editOverlayShadow) {
-    const ta = editOverlayShadow.querySelector('.edit-ta');
-    if (ta) ta.remove();
-  }
-}
-
-function openEditTextarea(target: HTMLElement) {
-  if (!editOverlayShadow) return;
-
-  const prev = editOverlayShadow.querySelector('.edit-ta');
-  if (prev) prev.remove();
-
-  const rect = target.getBoundingClientRect();
-  let cs: CSSStyleDeclaration;
-  try { cs = getComputedStyle(target); } catch { return; }
-
-  editOriginalText = target.textContent || '';
-
-  const ta = document.createElement('textarea');
-  ta.className = 'edit-ta';
-  ta.value = editOriginalText;
-  ta.style.left = `${rect.left}px`;
-  ta.style.top = `${rect.top}px`;
-  ta.style.width = `${Math.max(rect.width + 24, 140)}px`;
-  ta.style.height = `${Math.max(rect.height + 12, 44)}px`;
-  ta.style.fontSize = cs.fontSize;
-  ta.style.fontFamily = cs.fontFamily;
-  ta.style.fontWeight = cs.fontWeight;
-  ta.style.lineHeight = cs.lineHeight;
-  ta.style.letterSpacing = cs.letterSpacing;
-
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      e.stopPropagation();
-      commitActiveEdit();
-      return;
-    }
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      e.stopPropagation();
-      cancelActiveEdit();
-    }
-  });
-  ta.addEventListener('click', (e) => e.stopPropagation());
-  ta.addEventListener('pointerdown', (e) => e.stopPropagation());
-
-  editOverlayShadow.appendChild(ta);
-  requestAnimationFrame(() => { ta.focus(); ta.select(); });
-
-  activeEditTarget = target;
-  target.style.outline = '2px dashed #6366f1';
+  el.contentEditable = 'false';
+  el.style.outline = '';
 }
 
 const TEXT_LEAF_TAGS = new Set([
@@ -1053,37 +1060,48 @@ function handleEditClick(e: MouseEvent) {
   if (!editMode) return;
   const clicked = e.target as HTMLElement;
   if (!clicked) return;
-  if (toolbarHost && toolbarHost.contains(clicked)) return;
-  if (editOverlayHost && editOverlayHost.contains(clicked)) return;
+  if (toolbarHost && (toolbarHost.contains(clicked) || clicked === toolbarHost)) return;
+
+  if (activeEditable && activeEditable.contains(clicked)) return;
 
   e.preventDefault();
   e.stopPropagation();
 
-  if (activeEditTarget) {
-    commitActiveEdit();
-  }
-
   const target = findTextTarget(e.clientX, e.clientY, clicked);
   if (!target) return;
 
-  openEditTextarea(target);
-}
+  if (activeEditable && activeEditable !== target) {
+    commitActiveEditable();
+  }
 
-function enterEditMode() {
-  editMode = true;
-  createEditOverlay();
-  document.addEventListener('click', handleEditClick, true);
+  target.contentEditable = 'true';
+  target.style.outline = '2px solid #6366f1';
+  target.focus();
+
+  try {
+    const sel = window.getSelection();
+    if (sel && target.firstChild) {
+      const range = document.createRange();
+      range.selectNodeContents(target);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  } catch { /* selection API edge case */ }
+
+  activeEditable = target;
 }
 
 function exitEditMode() {
   editMode = false;
 
-  if (activeEditTarget) {
-    commitActiveEdit();
+  if (activeEditable) {
+    commitActiveEditable();
   }
 
-  destroyEditOverlay();
+  domSnapshot = new WeakMap();
   document.removeEventListener('click', handleEditClick, true);
+  document.removeEventListener('keydown', handleEditKeydown, true);
 }
 
 // ── Start/Stop Recording ──
@@ -1113,6 +1131,7 @@ function startRecording() {
     createFloatingToolbar();
     startToolbarTimer();
     startEditGuard();
+    loadEditsFromStorage();
   }
 }
 
@@ -1123,7 +1142,6 @@ function stopRecording() {
   if (isTopFrame) {
     stopEditGuard();
     if (editMode) exitEditMode();
-    destroyEditOverlay();
   }
 
   lastPointerCapture = null;
@@ -1219,17 +1237,6 @@ function messageHandler(message: ExtensionMessage, _sender: chrome.runtime.Messa
       if (toolbarHost) toolbarHost.style.display = '';
       sendResponse({ ok: true });
       break;
-    case 'APPLY_EDITS': {
-      const edits = message.payload as Record<string, string> | undefined;
-      if (edits) {
-        for (const [selector, text] of Object.entries(edits)) {
-          persistedEdits.set(selector, text);
-        }
-        setTimeout(applyPersistedEdits, 200);
-      }
-      sendResponse({ ok: true });
-      break;
-    }
     case 'GET_STATE':
       sendResponse({ isRecording, editMode });
       break;

@@ -96,8 +96,8 @@ sessionsRouter.delete('/:id', async (req, res) => {
       return;
     }
 
-    deleteSessionScreenshots(req.params.id);
     await db.delete(schema.sessions).where(eq(schema.sessions.id, req.params.id));
+    deleteSessionScreenshots(req.params.id);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete session' });
@@ -113,16 +113,20 @@ sessionsRouter.patch('/:id', async (req, res) => {
       return;
     }
 
+    const existing = await db.query.sessions.findFirst({
+      where: eq(schema.sessions.id, req.params.id),
+    });
+    if (!existing) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
     await db
       .update(schema.sessions)
       .set({ title, updatedAt: Date.now() })
       .where(eq(schema.sessions.id, req.params.id));
 
-    const session = await db.query.sessions.findFirst({
-      where: eq(schema.sessions.id, req.params.id),
-    });
-
-    res.json({ session });
+    res.json({ session: { ...existing, title, updatedAt: Date.now() } });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update session' });
   }
@@ -131,6 +135,14 @@ sessionsRouter.patch('/:id', async (req, res) => {
 // Batch upload events — use COUNT instead of fetching all rows
 sessionsRouter.post('/:id/events', async (req, res) => {
   try {
+    const session = await db.query.sessions.findFirst({
+      where: eq(schema.sessions.id, req.params.id),
+    });
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
     const { events } = req.body as BatchEventsRequest;
     if (!events || !Array.isArray(events)) {
       res.status(400).json({ error: 'Events array is required' });
@@ -200,6 +212,14 @@ sessionsRouter.post('/:id/screenshots', upload.single('screenshot'), async (req,
 // Finalize session: generate steps from events
 sessionsRouter.post('/:id/finalize', async (req, res) => {
   try {
+    const session = await db.query.sessions.findFirst({
+      where: eq(schema.sessions.id, req.params.id),
+    });
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
     const eventRows = await db
       .select()
       .from(schema.events)
@@ -243,34 +263,35 @@ sessionsRouter.post('/:id/finalize', async (req, res) => {
   }
 });
 
+// Update steps (reorder, edit text, delete) — batch operations
 sessionsRouter.put('/:id/steps', async (req, res) => {
   try {
     const { steps, deletedStepIds } = req.body as UpdateStepsRequest;
 
-    await db.transaction(async (tx) => {
-      if (deletedStepIds && deletedStepIds.length > 0) {
-        await tx.delete(schema.steps).where(inArray(schema.steps.id, deletedStepIds));
-      }
+    // Batch delete with inArray
+    if (deletedStepIds && deletedStepIds.length > 0) {
+      await db.delete(schema.steps).where(inArray(schema.steps.id, deletedStepIds));
+    }
 
-      if (steps && steps.length > 0) {
-        for (const step of steps) {
-          await tx
-            .update(schema.steps)
-            .set({
-              sortOrder: step.sortOrder,
-              title: step.title,
-              description: step.description,
-              isEdited: true,
-            })
-            .where(eq(schema.steps.id, step.id));
-        }
+    // Batch updates (still individual but unavoidable without raw SQL)
+    if (steps && steps.length > 0) {
+      for (const step of steps) {
+        await db
+          .update(schema.steps)
+          .set({
+            sortOrder: step.sortOrder,
+            title: step.title,
+            description: step.description,
+            isEdited: true,
+          })
+          .where(eq(schema.steps.id, step.id));
       }
+    }
 
-      await tx
-        .update(schema.sessions)
-        .set({ updatedAt: Date.now() })
-        .where(eq(schema.sessions.id, req.params.id));
-    });
+    await db
+      .update(schema.sessions)
+      .set({ updatedAt: Date.now() })
+      .where(eq(schema.sessions.id, req.params.id));
 
     const updatedSteps = await db
       .select()

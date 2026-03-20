@@ -265,11 +265,12 @@ export function generateSteps(
     if (primaryEvent.type === 'input') {
       const lastMeta = (group[group.length - 1].metadata as InputMeta);
       const finalValue = lastMeta.value || (primaryEvent.metadata as InputMeta).value || '';
-      if (finalValue.length === 0) { prevEvent = primaryEvent; continue; }
+      if (finalValue.length <= 2 && finalValue !== '') { prevEvent = primaryEvent; continue; }
     }
 
     if (primaryEvent.type === 'modal' && (primaryEvent.metadata as ModalMeta).action === 'open') {
       if (prevEvent && prevEvent.type === 'click') {
+        prevEvent = primaryEvent;
         continue;
       }
     }

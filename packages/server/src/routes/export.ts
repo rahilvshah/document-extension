@@ -35,7 +35,7 @@ exportRouter.get('/:id/export', async (req, res) => {
     };
 
     const data = { session: exportSession, steps };
-    const buffer = await exportZip(data);
+    const buffer = await exportZip(data, 'markdown');
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}.zip"`);
     res.send(buffer);

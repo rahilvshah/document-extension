@@ -163,7 +163,7 @@ function isStableId(id: string): boolean {
   return true;
 }
 
-function buildSelector(el: Element): string {
+export function buildSelector(el: Element): string {
   const tag = el.tagName.toLowerCase();
 
   const id = el.getAttribute('id');
@@ -321,13 +321,19 @@ export function resolveElement(el: Element): ElementInfo {
     const directText = getDirectText(el);
     if (directText) {
       info.text = directText;
-    } else if (el.querySelector('img[alt]')) {
-      info.text = (el.querySelector('img[alt]') as HTMLImageElement).alt;
-    } else if (el.querySelector('svg title')) {
-      info.text = el.querySelector('svg title')!.textContent || '';
     } else {
-      const ariaDesc = el.getAttribute('aria-label') || el.getAttribute('title');
-      if (ariaDesc) info.text = ariaDesc;
+      const img = el.querySelector('img[alt]') as HTMLImageElement | null;
+      if (img) {
+        info.text = img.alt;
+      } else {
+        const svgTitle = el.querySelector('svg title');
+        if (svgTitle) {
+          info.text = svgTitle.textContent || '';
+        } else {
+          const ariaDesc = el.getAttribute('aria-label') || el.getAttribute('title');
+          if (ariaDesc) info.text = ariaDesc;
+        }
+      }
     }
   }
 

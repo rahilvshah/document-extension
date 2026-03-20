@@ -50,10 +50,7 @@ export default function SessionEditor() {
   const serverSteps = data?.steps ?? [];
   const steps = localSteps ?? serverSteps;
 
-  const stepsRef = useRef(steps);
-  stepsRef.current = steps;
-
-  const pendingStepsRef = useRef<{ steps: Step[]; deletedStepIds?: string[] } | null>(null);
+  const mutationCountRef = useRef(0);
 
   const updateMutation = useMutation({
     mutationFn: (args: { steps: Step[]; deletedStepIds?: string[] }) =>
@@ -67,24 +64,28 @@ export default function SessionEditor() {
         deletedStepIds: args.deletedStepIds,
       }),
     onSuccess: (result) => {
+      mutationCountRef.current--;
       queryClient.setQueryData(['session', id], (old: typeof data) =>
         old ? { ...old, steps: result.steps } : old
       );
-      setLocalSteps(null);
+      if (mutationCountRef.current === 0) setLocalSteps(null);
       setSaveError(null);
     },
     onError: (err) => {
+      mutationCountRef.current--;
       console.error('Step update failed:', err);
       setSaveError('Failed to save — try again');
-      setLocalSteps(null);
+      if (mutationCountRef.current === 0) setLocalSteps(null);
     },
   });
 
+  const { mutate } = updateMutation;
+
   const flushUpdate = useCallback((args: { steps: Step[]; deletedStepIds?: string[] }) => {
-    pendingStepsRef.current = null;
+    mutationCountRef.current++;
     setLocalSteps(args.steps);
-    updateMutation.mutate(args);
-  }, [updateMutation]);
+    mutate(args);
+  }, [mutate]);
 
   const titleMutation = useMutation({
     mutationFn: (title: string) => updateSessionTitle(id!, title),
@@ -109,17 +110,20 @@ export default function SessionEditor() {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
 
+  const stepsRef = useRef(steps);
+  stepsRef.current = steps;
+
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
       const { active, over } = event;
       if (!over || active.id === over.id) return;
 
-      const currentSteps = stepsRef.current;
-      const oldIndex = currentSteps.findIndex((s) => s.id === active.id);
-      const newIndex = currentSteps.findIndex((s) => s.id === over.id);
+      const current = stepsRef.current;
+      const oldIndex = current.findIndex((s) => s.id === active.id);
+      const newIndex = current.findIndex((s) => s.id === over.id);
       if (oldIndex === -1 || newIndex === -1) return;
 
-      const reordered = [...currentSteps];
+      const reordered = [...current];
       const [moved] = reordered.splice(oldIndex, 1);
       reordered.splice(newIndex, 0, moved);
 
