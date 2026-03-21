@@ -154,6 +154,7 @@ export interface UpdateStepsRequest {
 export type ExtensionMessageType =
   | 'START_RECORDING'
   | 'STOP_RECORDING'
+  | 'CANCEL_RECORDING'
   | 'RECORDING_STATE'
   | 'EVENT_CAPTURED'
   | 'ENTER_EDIT_MODE'

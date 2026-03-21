@@ -45,3 +45,11 @@ export async function finalizeSession(sessionId: string) {
   if (!res.ok) throw new Error(`Finalize session failed: ${res.status}`);
   return res.json();
 }
+
+export async function deleteSession(sessionId: string) {
+  const res = await fetch(`${BASE_URL}/sessions/${sessionId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(`Delete session failed: ${res.status}`);
+  return res.json();
+}

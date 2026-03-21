@@ -1,6 +1,6 @@
 import type { RecordedEvent, RecordingState, ExtensionMessage, ClickMeta, InputMeta, SelectMeta } from '@docext/shared';
 import { storeEvent, storeScreenshot, getAllEvents, getAllScreenshots, clearAll } from './lib/idb-store.js';
-import { createSession, uploadEvents, uploadScreenshotBlob, finalizeSession } from './lib/api-client.js';
+import { createSession, uploadEvents, uploadScreenshotBlob, finalizeSession, deleteSession } from './lib/api-client.js';
 
 // ── Configuration ──
 
@@ -590,6 +590,15 @@ async function stopRecording() {
 
   const sessionId = state.sessionId;
 
+  // Stop batch timer first to prevent races during final flush
+  if (batchTimer) {
+    clearInterval(batchTimer);
+    batchTimer = null;
+  }
+
+  // Wait for any in-progress batch flush to finish
+  await waitForFlush();
+
   await waitForPendingCaptures();
   await captureFinalScreenshots();
 
@@ -599,12 +608,7 @@ async function stopRecording() {
     } catch { /* tab may have closed */ }
   }
 
-  if (batchTimer) {
-    clearInterval(batchTimer);
-    batchTimer = null;
-  }
-
-  await flushToBackend();
+  await forceFlushToBackend();
 
   if (sessionId && !sessionId.startsWith('local-')) {
     try {
@@ -619,6 +623,39 @@ async function stopRecording() {
   broadcastState();
 
   return sessionId;
+}
+
+async function cancelRecording() {
+  if (!state.isRecording) return;
+
+  const sessionId = state.sessionId;
+
+  if (batchTimer) {
+    clearInterval(batchTimer);
+    batchTimer = null;
+  }
+
+  if (activeTabId) {
+    try {
+      await chrome.tabs.sendMessage(activeTabId, { type: 'STOP_RECORDING' } as ExtensionMessage);
+    } catch { /* tab may have closed */ }
+  }
+
+  await clearAll();
+  pendingCaptures.clear();
+  eventQueue.length = 0;
+  processingEvent = false;
+
+  if (sessionId && !sessionId.startsWith('local-')) {
+    try {
+      await deleteSession(sessionId);
+    } catch (err) {
+      console.warn('[docext] Failed to delete cancelled session:', err);
+    }
+  }
+
+  state = defaultState();
+  broadcastState();
 }
 
 // ── Backend Sync ──
@@ -706,6 +743,37 @@ async function flushToBackend() {
   }
 }
 
+async function waitForFlush() {
+  const maxWait = 15_000;
+  const start = Date.now();
+  while (flushing && Date.now() - start < maxWait) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+async function forceFlushToBackend() {
+  await waitForFlush();
+
+  if (!state.sessionId || state.sessionId.startsWith('local-')) return;
+
+  flushing = true;
+  try {
+    const events = await getAllEvents();
+    if (events.length === 0) return;
+
+    const screenshots = await getAllScreenshots();
+    const ssMap = new Map(screenshots.map((s) => [s.id, s.blob]));
+
+    await uploadScreenshotsParallel(state.sessionId!, events, ssMap);
+    await uploadEvents(state.sessionId!, events);
+    await clearAll();
+  } catch (err) {
+    console.error('[docext] Force flush failed:', err);
+  } finally {
+    flushing = false;
+  }
+}
+
 // ── Message Listener ──
 
 chrome.runtime.onMessage.addListener(
@@ -723,6 +791,10 @@ chrome.runtime.onMessage.addListener(
             chrome.tabs.create({ url: `http://localhost:3001/session/${sessionId}` });
           }
           return { ...getState(), finishedSessionId: sessionId };
+        }
+        case 'CANCEL_RECORDING': {
+          await cancelRecording();
+          return getState();
         }
         case 'GET_STATE': {
           return getState();
