@@ -27,6 +27,7 @@ interface PersistedEdit {
   original: string;
   modified: string;
   tag: string;
+  ancestorPath?: string;
 }
 
 let editModeActive = false;
@@ -52,6 +53,35 @@ function normalizeWs(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+function getAncestorPath(el: Element): string {
+  const parts: string[] = [];
+  let cur = el.parentElement;
+  while (cur && parts.length < 4) {
+    const tag = cur.tagName.toLowerCase();
+    if (tag === 'body' || tag === 'html') break;
+    const id = cur.getAttribute('id');
+    const role = cur.getAttribute('role');
+    let seg = tag;
+    if (id) seg += `#${id.slice(0, 20)}`;
+    else if (role) seg += `[${role}]`;
+    parts.push(seg);
+    cur = cur.parentElement;
+  }
+  return parts.join('/');
+}
+
+function ancestorPathMatches(elPath: string, storedPath: string): boolean {
+  if (!storedPath || !elPath) return true;
+  const elParts = elPath.split('/');
+  const storedParts = storedPath.split('/');
+  let matches = 0;
+  const check = Math.min(elParts.length, storedParts.length, 3);
+  for (let i = 0; i < check; i++) {
+    if (elParts[i] === storedParts[i]) matches++;
+  }
+  return check === 0 || matches >= Math.ceil(check / 2);
+}
+
 function findElementByOriginalText(edit: PersistedEdit): Element | null {
   if (!edit.original) return null;
   const needle = normalizeWs(edit.original);
@@ -65,6 +95,7 @@ function findElementByOriginalText(edit: PersistedEdit): Element | null {
       if ((el as HTMLElement).dataset?.docextHidden) continue;
       if (el instanceof HTMLElement && !isSafeToHide(el)) continue;
       if (normalizeWs(el.textContent || '') !== needle) continue;
+      if (edit.ancestorPath && !ancestorPathMatches(getAncestorPath(el), edit.ancestorPath)) continue;
       const count = el.children.length;
       if (count < bestChildren) {
         best = el;
@@ -115,10 +146,17 @@ function applyTextEdit(el: Element, newText: string) {
 function selectorMatchesContent(el: Element, edit: PersistedEdit): boolean {
   const elText = normalizeWs(el.textContent || '');
   const origText = normalizeWs(edit.original);
-  if (origText === '' && elText === '') return true;
-  if (origText === '' && elText.length < 5) return true;
-  if (origText && elText === origText) return true;
-  if (origText && edit.modified !== DELETED_SENTINEL && elText === normalizeWs(edit.modified)) return true;
+
+  if (origText === '' || origText.length < 5) {
+    if (elText.length > 10) return false;
+    if (el.tagName.toLowerCase() !== edit.tag) return false;
+    if (edit.ancestorPath) {
+      return ancestorPathMatches(getAncestorPath(el), edit.ancestorPath);
+    }
+    return true;
+  }
+  if (elText === origText) return true;
+  if (edit.modified !== DELETED_SENTINEL && elText === normalizeWs(edit.modified)) return true;
   return false;
 }
 
@@ -368,6 +406,7 @@ function commitActiveEditable() {
       original,
       modified,
       tag: el.tagName.toLowerCase(),
+      ancestorPath: getAncestorPath(el),
     });
     if (el.firstChild) domSnapshot.set(el.firstChild, modified);
     saveEditsToStorage();
@@ -417,6 +456,7 @@ function handleEditKeydown(e: KeyboardEvent) {
       original: (el.textContent || '').trim(),
       modified: DELETED_SENTINEL,
       tag: el.tagName.toLowerCase(),
+      ancestorPath: getAncestorPath(el),
     });
     saveEditsToStorage();
     return;

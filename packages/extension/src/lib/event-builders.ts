@@ -45,6 +45,12 @@ export function buildClickEvent(
     breadcrumb: info.breadcrumb,
     tooltipText: info.tooltipText,
     inputValue: info.inputValue,
+    parentId: info.parentId,
+    parentName: info.parentName,
+    listPosition: info.listPosition,
+    nearbyText: info.nearbyText,
+    viewportHint: info.viewportHint,
+    semanticClasses: info.semanticClasses,
   };
   return {
     id: generateId(),
@@ -81,6 +87,8 @@ export function buildInputEvent(el: Element, info: ElementInfo): RecordedEvent {
     elementRect: { x: r.left, y: r.top, width: r.width, height: r.height },
     cropRect: { x: cr.x, y: cr.y, width: cr.width, height: cr.height },
     viewportSize: { width: window.innerWidth, height: window.innerHeight },
+    parentId: info.parentId,
+    listPosition: info.listPosition,
   };
   return {
     id: generateId(),
@@ -108,6 +116,8 @@ export function buildSelectEvent(el: HTMLSelectElement, info: ElementInfo): Reco
     elementRect: { x: r.left, y: r.top, width: r.width, height: r.height },
     cropRect: { x: cr.x, y: cr.y, width: cr.width, height: cr.height },
     viewportSize: { width: window.innerWidth, height: window.innerHeight },
+    parentId: info.parentId,
+    listPosition: info.listPosition,
   };
   return {
     id: generateId(),

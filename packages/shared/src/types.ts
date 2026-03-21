@@ -28,6 +28,12 @@ export interface ClickMeta {
   breadcrumb?: string;
   tooltipText?: string;
   inputValue?: string;
+  parentId?: string;
+  parentName?: string;
+  listPosition?: string;
+  nearbyText?: string;
+  viewportHint?: string;
+  semanticClasses?: string;
 }
 
 export interface InputMeta {
@@ -43,6 +49,8 @@ export interface InputMeta {
   elementRect?: { x: number; y: number; width: number; height: number };
   cropRect?: { x: number; y: number; width: number; height: number };
   viewportSize?: { width: number; height: number };
+  parentId?: string;
+  listPosition?: string;
 }
 
 export interface SelectMeta {
@@ -56,6 +64,8 @@ export interface SelectMeta {
   elementRect?: { x: number; y: number; width: number; height: number };
   cropRect?: { x: number; y: number; width: number; height: number };
   viewportSize?: { width: number; height: number };
+  parentId?: string;
+  listPosition?: string;
 }
 
 export interface NavigateMeta {

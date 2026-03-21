@@ -16,6 +16,12 @@ export interface ElementInfo {
   parentText?: string;
   breadcrumb?: string;
   tooltipText?: string;
+  parentId?: string;
+  parentName?: string;
+  listPosition?: string;
+  nearbyText?: string;
+  viewportHint?: string;
+  semanticClasses?: string;
 }
 
 function getAriaLabel(el: Element): string | undefined {
@@ -163,6 +169,46 @@ function isStableId(id: string): boolean {
   return true;
 }
 
+function buildAnchoredPath(el: Element): string | null {
+  const segments: string[] = [];
+  let current: Element | null = el;
+  let depth = 0;
+
+  while (current && depth < 6) {
+    const tag = current.tagName.toLowerCase();
+    if (tag === 'body' || tag === 'html') break;
+
+    const id = current.getAttribute('id');
+    if (id && isStableId(id)) {
+      segments.unshift(`#${CSS.escape(id)}`);
+      return segments.join(' > ');
+    }
+
+    const testId = current.getAttribute('data-testid') || current.getAttribute('data-test-id');
+    if (testId) {
+      segments.unshift(`[data-testid="${CSS.escape(testId)}"]`);
+      return segments.join(' > ');
+    }
+
+    const parent = current.parentElement;
+    if (parent) {
+      const siblings = Array.from(parent.children).filter((c) => c.tagName === current!.tagName);
+      if (siblings.length === 1) {
+        segments.unshift(tag);
+      } else {
+        const index = siblings.indexOf(current) + 1;
+        segments.unshift(`${tag}:nth-child(${index})`);
+      }
+    } else {
+      segments.unshift(tag);
+    }
+
+    current = parent;
+    depth++;
+  }
+  return null;
+}
+
 export function buildSelector(el: Element): string {
   const tag = el.tagName.toLowerCase();
 
@@ -186,6 +232,9 @@ export function buildSelector(el: Element): string {
 
   const parent = el.parentElement;
   if (parent) {
+    const anchorPath = buildAnchoredPath(el);
+    if (anchorPath) return anchorPath;
+
     const siblings = Array.from(parent.children).filter(
       (c) => c.tagName === el.tagName
     );
@@ -264,6 +313,13 @@ function getBreadcrumb(el: Element): string | undefined {
         const semanticMap: Record<string, string> = { nav: 'Navigation', header: 'Header', footer: 'Footer', main: 'Main', aside: 'Sidebar', form: 'Form', dialog: 'Dialog' };
         if (tag in semanticMap) label = semanticMap[tag];
       }
+      if (!label) {
+        const id = current.getAttribute('id');
+        if (id && isStableId(id) && id.length < 30) {
+          label = id.replace(/[-_]+/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2');
+          label = label.charAt(0).toUpperCase() + label.slice(1);
+        }
+      }
 
       if (label && !parts.includes(label)) {
         parts.unshift(label);
@@ -285,6 +341,147 @@ function getTooltipText(el: Element): string | undefined {
     if (tooltip && tooltip.length < 100) return tooltip;
   } catch { /* detached or cross-origin */ }
   return undefined;
+}
+
+function getParentId(el: Element): string | undefined {
+  try {
+    let current = el.parentElement;
+    let depth = 0;
+    while (current && depth < 6) {
+      const tag = current.tagName.toLowerCase();
+      if (tag === 'body' || tag === 'html') break;
+      const id = current.getAttribute('id');
+      if (id && isStableId(id)) return id;
+      current = current.parentElement;
+      depth++;
+    }
+  } catch { /* detached or cross-origin */ }
+  return undefined;
+}
+
+const LIST_ITEM_ROLES = new Set(['option', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'treeitem', 'tab', 'listitem']);
+const LIST_CONTAINER_TAGS = new Set(['ul', 'ol', 'menu']);
+const LIST_CONTAINER_ROLES = new Set(['list', 'listbox', 'menu', 'menubar', 'tablist', 'tree', 'group']);
+
+function getListPosition(el: Element): string | undefined {
+  try {
+    let item: Element | null = el;
+    let depth = 0;
+    while (item && depth < 4) {
+      const tag = item.tagName.toLowerCase();
+      const role = item.getAttribute('role');
+      if (tag === 'li' || (role && LIST_ITEM_ROLES.has(role))) break;
+      item = item.parentElement;
+      depth++;
+    }
+    if (!item) return undefined;
+
+    const container = item.parentElement;
+    if (!container) return undefined;
+
+    const cTag = container.tagName.toLowerCase();
+    const cRole = container.getAttribute('role');
+    if (!LIST_CONTAINER_TAGS.has(cTag) && !(cRole && LIST_CONTAINER_ROLES.has(cRole))) return undefined;
+
+    const itemTag = item.tagName.toLowerCase();
+    const itemRole = item.getAttribute('role');
+    const siblings = Array.from(container.children).filter((c) => {
+      if (c.tagName.toLowerCase() === itemTag) return true;
+      const r = c.getAttribute('role');
+      return r !== null && itemRole !== null && r === itemRole;
+    });
+
+    const index = siblings.indexOf(item) + 1;
+    if (index < 1 || siblings.length < 2) return undefined;
+    return `${index} of ${siblings.length}`;
+  } catch { /* detached or cross-origin */ }
+  return undefined;
+}
+
+function getNearbyText(el: Element): string | undefined {
+  try {
+    const prev = el.previousElementSibling;
+    if (prev) {
+      const t = (prev.textContent || '').replace(/\s+/g, ' ').trim();
+      if (t.length > 0 && t.length < 50) return t;
+    }
+    const next = el.nextElementSibling;
+    if (next) {
+      const t = (next.textContent || '').replace(/\s+/g, ' ').trim();
+      if (t.length > 0 && t.length < 50) return t;
+    }
+  } catch { /* detached or cross-origin */ }
+  return undefined;
+}
+
+function getParentName(el: Element): string | undefined {
+  try {
+    let current = el.parentElement;
+    let depth = 0;
+    while (current && depth < 6) {
+      const tag = current.tagName.toLowerCase();
+      if (tag === 'body' || tag === 'html') break;
+
+      const ariaLabel = current.getAttribute('aria-label');
+      if (ariaLabel && ariaLabel.length < 80) return ariaLabel;
+
+      if (isStrongInteractive(current) || ['nav', 'aside', 'section', 'header', 'footer', 'form', 'dialog'].includes(tag)) {
+        const text = getDirectText(current);
+        if (text && text.length > 1 && text.length < 60) return text;
+      }
+
+      const id = current.getAttribute('id');
+      if (id && isStableId(id) && id.length < 40) {
+        const humanized = id.replace(/[-_]+/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().trim();
+        if (humanized.length > 1) return humanized;
+      }
+
+      current = current.parentElement;
+      depth++;
+    }
+  } catch { /* detached or cross-origin */ }
+  return undefined;
+}
+
+function getViewportHint(el: Element): string | undefined {
+  try {
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return undefined;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+
+    const horiz = cx < vw * 0.25 ? 'left' : cx > vw * 0.75 ? 'right' : 'center';
+    const vert = cy < vh * 0.25 ? 'top' : cy > vh * 0.75 ? 'bottom' : 'middle';
+
+    if (horiz === 'left' && vert !== 'top' && vert !== 'bottom') return 'left panel';
+    if (horiz === 'right' && vert !== 'top' && vert !== 'bottom') return 'right panel';
+    if (vert === 'top' && horiz === 'center') return 'top of the page';
+    if (vert === 'bottom' && horiz === 'center') return 'bottom of the page';
+    if (vert === 'top' && horiz === 'left') return 'top-left area';
+    if (vert === 'top' && horiz === 'right') return 'top-right area';
+    if (vert === 'bottom' && horiz === 'left') return 'bottom-left area';
+    if (vert === 'bottom' && horiz === 'right') return 'bottom-right area';
+    return undefined;
+  } catch { return undefined; }
+}
+
+const NOISE_CLASS_RE = /^(css-|_|jsx-|sc-|tw-|svelte-|ng-|chakra-|mu[iI]|emotion-|cl-|rs-)/;
+const HEX_CLASS_RE = /[0-9a-f]{6,}/i;
+
+function getSemanticClasses(el: Element): string | undefined {
+  try {
+    const classes = Array.from(el.classList).filter((c) => {
+      if (c.length > 40 || c.length < 3) return false;
+      if (NOISE_CLASS_RE.test(c)) return false;
+      if (HEX_CLASS_RE.test(c)) return false;
+      if (/^\d/.test(c)) return false;
+      return true;
+    });
+    if (classes.length === 0) return undefined;
+    return classes.slice(0, 3).join(', ');
+  } catch { return undefined; }
 }
 
 export function resolveElement(el: Element): ElementInfo {
@@ -341,6 +538,12 @@ export function resolveElement(el: Element): ElementInfo {
     info.parentText = getParentText(el);
     info.breadcrumb = getBreadcrumb(el);
     info.tooltipText = getTooltipText(el);
+    info.parentId = getParentId(el);
+    info.parentName = getParentName(el);
+    info.listPosition = getListPosition(el);
+    info.nearbyText = getNearbyText(el);
+    info.viewportHint = getViewportHint(el);
+    info.semanticClasses = getSemanticClasses(el);
   } catch { /* safe fallback */ }
 
   return info;

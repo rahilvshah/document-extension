@@ -33,7 +33,15 @@ function cleanLabel(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
-function locationHint(meta: { containerRole?: string; sectionLabel?: string; nearestHeading?: string }): string {
+function humanizeId(id: string): string {
+  return id
+    .replace(/[-_]+/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .trim();
+}
+
+function locationHint(meta: { containerRole?: string; sectionLabel?: string; nearestHeading?: string; parentId?: string; parentName?: string; viewportHint?: string }): string {
   if (meta.sectionLabel) return ` in the ${cleanLabel(meta.sectionLabel)} section`;
   if (meta.containerRole === 'navigation') return ' in the navigation';
   if (meta.containerRole === 'toolbar') return ' in the toolbar';
@@ -44,7 +52,19 @@ function locationHint(meta: { containerRole?: string; sectionLabel?: string; nea
   if (meta.containerRole === 'sidebar') return ' in the sidebar';
   if (meta.containerRole === 'form') return ' in the form';
   if (meta.containerRole === 'search') return ' in the search area';
+  if (meta.parentName) return ` in the ${truncate(meta.parentName, 30)} area`;
+  if (meta.parentId) {
+    const name = humanizeId(meta.parentId);
+    if (name.length > 1) return ` in the ${name} section`;
+  }
+  if (meta.viewportHint) return ` in the ${meta.viewportHint}`;
   return '';
+}
+
+function ordinal(n: number): string {
+  const s = ['th', 'st', 'nd', 'rd'];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
 const SENSITIVE_FIELDS = /password|secret|token|ssn|credit.?card|cvv|pin|social.?security/i;
@@ -56,6 +76,7 @@ function bestLabel(m: ClickMeta): string {
   if (m.title) return m.title;
   if (m.tooltipText) return m.tooltipText;
   if (m.parentText && m.parentText.length > 1) return m.parentText;
+  if (m.parentName && m.parentName.length > 1) return m.parentName;
   return '';
 }
 
@@ -100,11 +121,14 @@ function titleForClick(m: ClickMeta): string {
     if (m.ariaLabel) return `Click the ${quote(m.ariaLabel)} icon${loc}`;
     if (m.tooltipText) return `Click the ${quote(m.tooltipText)} icon${loc}`;
     if (m.parentText) return `Click the ${quote(m.parentText)} icon${loc}`;
+    if (m.parentName) return `Click the icon in ${quote(m.parentName)}${loc}`;
+    if (m.nearbyText) return `Click the icon next to ${quote(m.nearbyText)}${loc}`;
     if (m.nearestHeading) return `Click an icon near ${quote(m.nearestHeading)}${loc}`;
     return `Click an icon${loc}`;
   }
 
   if (!label || label === m.elementTag) {
+    if (m.nearbyText) return `Click next to ${quote(m.nearbyText)}${loc}`;
     if (m.nearestHeading) return `Click near ${quote(m.nearestHeading)}${loc}`;
     return `Click an element${loc}`;
   }
@@ -174,34 +198,86 @@ function titleForModal(m: ModalMeta): string {
   return 'A dialog appears';
 }
 
-function descriptionForEvent(event: RecordedEvent): string {
+function alreadyInTitle(titleLower: string, text: string | undefined): boolean {
+  if (!text || text.length < 2) return true;
+  return titleLower.includes(text.toLowerCase());
+}
+
+function humanizeClasses(classes: string): string {
+  return classes
+    .split(', ')
+    .map((c) => c.replace(/[-_]+/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase())
+    .join(', ');
+}
+
+function descriptionForEvent(event: RecordedEvent, title: string): string {
   const parts: string[] = [];
   const meta = event.metadata;
+  const tl = title.toLowerCase();
 
   switch (event.type) {
     case 'click': {
       const m = meta as ClickMeta;
-      if (m.breadcrumb) parts.push(`Location: ${m.breadcrumb}`);
-      if (m.tooltipText && m.tooltipText !== m.ariaLabel) parts.push(`Tooltip: "${truncate(m.tooltipText, 60)}"`);
+      if (m.breadcrumb) parts.push(`Found in ${m.breadcrumb}`);
+      if (m.viewportHint && !alreadyInTitle(tl, m.viewportHint)) {
+        parts.push(`Located in the ${m.viewportHint}`);
+      }
+      if (m.listPosition) {
+        const [pos, total] = m.listPosition.split(' of ');
+        parts.push(`${ordinal(Number(pos))} item in a list of ${total}`);
+      }
+      if (m.parentName && !alreadyInTitle(tl, m.parentName)) {
+        parts.push(`Inside the "${truncate(m.parentName, 40)}" area`);
+      }
+      if (m.nearbyText && !alreadyInTitle(tl, m.nearbyText)) {
+        parts.push(`Next to "${truncate(m.nearbyText, 40)}"`);
+      }
+      if (m.tooltipText && m.tooltipText !== m.ariaLabel && !alreadyInTitle(tl, m.tooltipText)) {
+        parts.push(`Shows "${truncate(m.tooltipText, 50)}" on hover`);
+      }
+      if (m.nearestHeading && !alreadyInTitle(tl, m.nearestHeading)) {
+        parts.push(`Under the "${truncate(m.nearestHeading, 40)}" heading`);
+      }
+      if (m.semanticClasses) {
+        parts.push(`Styled as ${humanizeClasses(m.semanticClasses)}`);
+      }
       const elType = m.role || m.elementTag;
-      if (elType && !['div', 'span', 'p'].includes(elType)) parts.push(`Element: <${elType}>`);
+      if (elType && !['div', 'span', 'p'].includes(elType)) parts.push(`${elType} element`);
       break;
     }
     case 'input': {
       const m = meta as InputMeta;
-      if (m.breadcrumb) parts.push(`Location: ${m.breadcrumb}`);
-      if (m.placeholder) parts.push(`Placeholder: "${m.placeholder}"`);
-      if (m.fieldType && m.fieldType !== 'text') parts.push(`Type: ${m.fieldType}`);
+      if (m.breadcrumb) parts.push(`Found in ${m.breadcrumb}`);
+      if (m.listPosition) {
+        const [pos, total] = m.listPosition.split(' of ');
+        parts.push(`${ordinal(Number(pos))} field in a group of ${total}`);
+      }
+      if (m.placeholder && !alreadyInTitle(tl, m.placeholder)) {
+        parts.push(`Placeholder reads "${m.placeholder}"`);
+      }
+      if (m.nearestHeading && !alreadyInTitle(tl, m.nearestHeading)) {
+        parts.push(`Under the "${truncate(m.nearestHeading, 40)}" heading`);
+      }
+      if (m.fieldType && m.fieldType !== 'text') parts.push(`${m.fieldType} field`);
       break;
     }
     case 'select': {
       const m = meta as SelectMeta;
-      if (m.breadcrumb) parts.push(`Location: ${m.breadcrumb}`);
+      if (m.breadcrumb) parts.push(`Found in ${m.breadcrumb}`);
+      if (m.listPosition) {
+        const [pos, total] = m.listPosition.split(' of ');
+        parts.push(`${ordinal(Number(pos))} field in a group of ${total}`);
+      }
+      if (m.nearestHeading && !alreadyInTitle(tl, m.nearestHeading)) {
+        parts.push(`Under the "${truncate(m.nearestHeading, 40)}" heading`);
+      }
       break;
     }
     case 'submit': {
       const m = meta as SubmitMeta;
-      if (m.fieldCount > 0) parts.push(`${m.fieldCount} field${m.fieldCount > 1 ? 's' : ''}`);
+      if (m.fieldCount > 0) {
+        parts.push(`Form contains ${m.fieldCount} field${m.fieldCount > 1 ? 's' : ''}`);
+      }
       break;
     }
     case 'modal': {
@@ -211,7 +287,7 @@ function descriptionForEvent(event: RecordedEvent): string {
     }
   }
 
-  return parts.join(' · ');
+  return parts.join('. ');
 }
 
 function mergeConsecutiveInputs(events: RecordedEvent[]): RecordedEvent[][] {
@@ -304,7 +380,7 @@ export function generateSteps(
     const lastEvent = group[group.length - 1];
     const screenshotId = lastEvent.screenshotId ?? primaryEvent.screenshotId;
     const altScreenshotId = lastEvent.altScreenshotId ?? primaryEvent.altScreenshotId;
-    const description = descriptionForEvent(primaryEvent);
+    const description = descriptionForEvent(primaryEvent, title);
 
     rawSteps.push({
       title,
