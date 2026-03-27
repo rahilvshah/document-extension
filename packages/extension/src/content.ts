@@ -308,6 +308,18 @@ function handlePointerdown(e: PointerEvent) {
   const target = resolveClickTarget(rawTarget);
   if (!target) return;
 
+  // If user clicks away from an active text field, flush its pending debounced
+  // input first so typed edits are recorded before the click action.
+  const active = document.activeElement;
+  if (
+    active &&
+    active !== target &&
+    (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement)
+  ) {
+    const activeInfo = resolveElement(active);
+    flushPendingInput(activeInfo.selector, sendEvent);
+  }
+
   const info = resolveElement(target);
   if (isDuplicateClick(info.selector, Date.now())) return;
 
@@ -460,12 +472,9 @@ function handleBlur(e: FocusEvent) {
   if (!(target instanceof HTMLInputElement) && !(target instanceof HTMLTextAreaElement)) return;
 
   const info = resolveElement(target);
+  // Blur should flush pending debounced input only; emitting a fresh input event
+  // here duplicates actions for modal/save flows.
   flushPendingInput(info.selector, sendEvent);
-
-  const value = target.value;
-  if (!value || value.length === 0) return;
-
-  sendEvent(buildInputEvent(target, info));
 }
 
 function handleChange(e: Event) {
@@ -476,6 +485,11 @@ function handleChange(e: Event) {
     sendEvent(buildSelectEvent(target, info));
     return;
   }
+}
+
+function handleInput(e: Event) {
+  if (!isRecording || isEditMode() || capturePaused) return;
+  const target = e.target as Element;
   if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
     const info = resolveElement(target);
     debounceInput(buildInputEvent(target, info), info.selector, sendEvent);
@@ -487,6 +501,9 @@ function handleSubmit(e: Event) {
   const form = e.target as HTMLFormElement;
   if (!(form instanceof HTMLFormElement)) return;
   flushAllPending(sendEvent);
+  // A submit immediately after a captured click (e.g., "Save") is the same
+  // user intent. Skip duplicate submit events in that window.
+  if (Date.now() - lastClickSentAt < 1200) return;
   sendEvent(buildSubmitEvent(form));
 }
 
@@ -505,6 +522,7 @@ function startRecording() {
   document.addEventListener('pointerup', handlePointerup, true);
   document.addEventListener('click', handleClick, true);
   document.addEventListener('blur', handleBlur, true);
+  document.addEventListener('input', handleInput, true);
   document.addEventListener('change', handleChange, true);
   document.addEventListener('submit', handleSubmit, true);
 
@@ -537,6 +555,7 @@ function stopRecording() {
   document.removeEventListener('pointerup', handlePointerup, true);
   document.removeEventListener('click', handleClick, true);
   document.removeEventListener('blur', handleBlur, true);
+  document.removeEventListener('input', handleInput, true);
   document.removeEventListener('change', handleChange, true);
   document.removeEventListener('submit', handleSubmit, true);
 

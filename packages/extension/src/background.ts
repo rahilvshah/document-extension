@@ -367,7 +367,32 @@ async function setEmulatedTheme(theme: 'light' | 'dark' | 'system') {
       type: 'TOGGLE_THEME',
       payload: { theme },
     } as ExtensionMessage);
-  } catch {}
+  } catch {
+    // Fallback: content script might not be ready on a fresh navigation.
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: activeTabId },
+        world: 'MAIN',
+        args: [theme],
+        func: (t: 'light' | 'dark' | 'system') => {
+          const html = document.documentElement;
+          if (t === 'dark') {
+            html.classList.add('dark');
+            html.setAttribute('data-theme', 'dark');
+            html.style.colorScheme = 'dark';
+          } else if (t === 'light') {
+            html.classList.remove('dark');
+            html.setAttribute('data-theme', 'light');
+            html.style.colorScheme = 'light';
+          } else {
+            html.classList.remove('dark');
+            html.removeAttribute('data-theme');
+            html.style.colorScheme = '';
+          }
+        },
+      });
+    } catch {}
+  }
   state.theme = theme;
 }
 
@@ -490,13 +515,22 @@ async function captureDualScreenshots(
   return processRawDual(raw, opts);
 }
 
+function sortEventsForUpload(events: RecordedEvent[]): RecordedEvent[] {
+  return [...events].sort((a, b) => {
+    if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+    return a.id.localeCompare(b.id);
+  });
+}
+
 // ── Event Processing ──
 
 async function handleEventCaptured(event: RecordedEvent) {
   dbg('handleEventCaptured:start', event.type, event.id);
   const isClick = event.type === 'click';
   const isNavigate = event.type === 'navigate';
+  const isModal = event.type === 'modal';
   const isEphemeralClick = isClick && !!(event.metadata as ClickMeta | undefined)?.inEphemeralUI;
+  const shouldCaptureScreenshot = isClick || isNavigate || isModal;
   if (event.url) lastKnownUrl = event.url;
 
   try {
@@ -506,6 +540,13 @@ async function handleEventCaptured(event: RecordedEvent) {
     } else {
       const delay = isClick ? CLICK_SCREENSHOT_DELAY_MS : SCREENSHOT_DELAY_MS;
       await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+
+    if (!shouldCaptureScreenshot) {
+      await storeEvent(event);
+      state.eventCount++;
+      broadcastState();
+      return;
     }
 
     let opts: ScreenshotOpts | undefined;
@@ -544,7 +585,11 @@ async function handleEventCaptured(event: RecordedEvent) {
     })();
 
     pendingCaptures.add(processPromise);
-    processPromise.finally(() => pendingCaptures.delete(processPromise));
+    try {
+      await processPromise;
+    } finally {
+      pendingCaptures.delete(processPromise);
+    }
   } catch (err) {
     console.warn('[docext] Event capture failed:', err);
     try { await storeEvent(event); state.eventCount++; broadcastState(); } catch {}
@@ -776,7 +821,7 @@ async function flushToBackend() {
   flushing = true;
 
   try {
-    const events = await getAllEvents();
+    const events = sortEventsForUpload(await getAllEvents());
     if (events.length === 0) return;
 
     const screenshots = await getAllScreenshots();
@@ -807,7 +852,7 @@ async function forceFlushToBackend() {
 
   flushing = true;
   try {
-    const events = await getAllEvents();
+    const events = sortEventsForUpload(await getAllEvents());
     if (events.length === 0) return;
 
     const screenshots = await getAllScreenshots();
