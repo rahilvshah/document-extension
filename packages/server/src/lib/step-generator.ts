@@ -392,7 +392,7 @@ export function generateSteps(
     });
   }
 
-  // Deduplicate identical adjacent steps (same normalized title, close timing, redundant screenshots)
+  // Deduplicate identical adjacent steps
   const deduped: RawStep[] = [];
   for (const step of rawSteps) {
     if (deduped.length > 0) {
@@ -400,21 +400,39 @@ export function generateSteps(
       const sameTitleExact = prev.title === step.title;
       const sameTitleNorm = normalizeTitle(prev.title) === normalizeTitle(step.title);
       const timeDiff = Math.abs(step.timestamp - prev.timestamp);
-      const bothHaveScreenshots = prev.screenshotId && step.screenshotId;
 
-      if (sameTitleExact && timeDiff < 1000 && !bothHaveScreenshots) {
+      // Same exact title within 3s: merge, keep later screenshots
+      if (sameTitleExact && timeDiff < 3000) {
         prev.sourceEventIds.push(...step.sourceEventIds);
         if (step.screenshotId) prev.screenshotId = step.screenshotId;
         if (step.altScreenshotId) prev.altScreenshotId = step.altScreenshotId;
         continue;
       }
 
-      if (sameTitleNorm && timeDiff < 500 && !bothHaveScreenshots) {
+      // Similar title within 1s: merge, keep longer title and later screenshots
+      if (sameTitleNorm && timeDiff < 1000) {
         prev.sourceEventIds.push(...step.sourceEventIds);
         if (step.screenshotId) prev.screenshotId = step.screenshotId;
         if (step.altScreenshotId) prev.altScreenshotId = step.altScreenshotId;
         if (step.title.length > prev.title.length) prev.title = step.title;
         continue;
+      }
+
+      // Container subsumption: if prev is a generic click and current is a
+      // more specific click on something inside the same area, drop prev
+      if (timeDiff < 5000) {
+        const prevNorm = normalizeTitle(prev.title);
+        const stepNorm = normalizeTitle(step.title);
+        const prevLabel = prevNorm.match(/click\s+"([^"]+)"/)?.[1];
+        const stepLabel = stepNorm.match(/click\s+"([^"]+)"/)?.[1];
+        if (prevLabel && stepLabel && prevLabel !== stepLabel && stepNorm.includes(prevLabel)) {
+          prev.title = step.title;
+          prev.description = step.description;
+          prev.sourceEventIds.push(...step.sourceEventIds);
+          if (step.screenshotId) prev.screenshotId = step.screenshotId;
+          if (step.altScreenshotId) prev.altScreenshotId = step.altScreenshotId;
+          continue;
+        }
       }
     }
     deduped.push(step);

@@ -78,6 +78,7 @@ let state: RecordingState = defaultState();
 let batchTimer: ReturnType<typeof setInterval> | null = null;
 let activeTabId: number | null = null;
 let flushing = false;
+let lastKnownUrl = '';
 const pendingCaptures = new Set<Promise<void>>();
 
 function getState(): RecordingState {
@@ -277,6 +278,36 @@ async function processScreenshot(blob: Blob, opts?: ScreenshotOpts): Promise<Blo
 
 // ── Toolbar Visibility ──
 
+async function suppressTransitions() {
+  if (!activeTabId) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: activeTabId },
+      func: () => {
+        let style = document.getElementById('docext-no-transitions');
+        if (!style) {
+          style = document.createElement('style');
+          style.id = 'docext-no-transitions';
+          style.textContent = '*, *::before, *::after { transition: none !important; animation: none !important; }';
+          document.head.appendChild(style);
+        }
+      },
+    });
+  } catch {}
+}
+
+async function restoreTransitions() {
+  if (!activeTabId) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: activeTabId },
+      func: () => {
+        document.getElementById('docext-no-transitions')?.remove();
+      },
+    });
+  } catch {}
+}
+
 async function hideToolbar() {
   if (!activeTabId) return;
   try {
@@ -365,6 +396,7 @@ interface RawDualCapture {
 async function captureRawDual(themeSettleMs = 300): Promise<RawDualCapture> {
   const result: RawDualCapture = { lightRaw: null, darkRaw: null, fallbackRaw: null };
   const originalTheme = state.theme;
+  const fastSettle = Math.min(themeSettleMs, 50);
 
   try {
     await hideToolbar();
@@ -372,24 +404,26 @@ async function captureRawDual(themeSettleMs = 300): Promise<RawDualCapture> {
     if (activeTabId) {
       try {
         await pauseContentCapture();
+        await suppressTransitions();
 
         const needsLightSwitch = originalTheme !== 'light';
         if (needsLightSwitch) {
           await setEmulatedTheme('light');
-          await new Promise((r) => setTimeout(r, themeSettleMs));
+          await new Promise((r) => setTimeout(r, fastSettle));
         }
 
         const lightDataUrl = await chrome.tabs.captureVisibleTab({ format: 'png' });
         result.lightRaw = await (await globalThis.fetch(lightDataUrl)).blob();
 
         await setEmulatedTheme('dark');
-        await new Promise((r) => setTimeout(r, themeSettleMs));
+        await new Promise((r) => setTimeout(r, fastSettle));
 
         const darkDataUrl = await chrome.tabs.captureVisibleTab({ format: 'png' });
         result.darkRaw = await (await globalThis.fetch(darkDataUrl)).blob();
 
         await setEmulatedTheme(originalTheme === 'system' ? 'system' : originalTheme);
-        await new Promise((r) => setTimeout(r, 50));
+        await new Promise((r) => setTimeout(r, 30));
+        await restoreTransitions();
         await resumeContentCapture();
 
         await showToolbar();
@@ -397,6 +431,7 @@ async function captureRawDual(themeSettleMs = 300): Promise<RawDualCapture> {
       } catch (err) {
         console.warn('[docext] Dual-theme capture failed, falling back:', err);
         try { await setEmulatedTheme(originalTheme === 'system' ? 'system' : originalTheme); } catch {}
+        await restoreTransitions();
         await resumeContentCapture();
       }
     }
@@ -457,6 +492,7 @@ async function captureDualScreenshots(
 async function handleEventCaptured(event: RecordedEvent) {
   const isClick = event.type === 'click';
   const isNavigate = event.type === 'navigate';
+  if (event.url) lastKnownUrl = event.url;
 
   try {
     if (isNavigate && activeTabId) {
@@ -531,6 +567,7 @@ async function startRecording(tab: chrome.tabs.Tab) {
     state = { ...defaultState(), isRecording: true, sessionId: `local-${Date.now()}`, startedAt: Date.now() };
   }
 
+  lastKnownUrl = tab.url || '';
   await clearAll();
   pendingCaptures.clear();
 
@@ -619,6 +656,7 @@ async function stopRecording() {
   }
 
   state = defaultState();
+  lastKnownUrl = '';
   pendingCaptures.clear();
   broadcastState();
 
@@ -655,6 +693,7 @@ async function cancelRecording() {
   }
 
   state = defaultState();
+  lastKnownUrl = '';
   broadcastState();
 }
 
@@ -858,12 +897,61 @@ function injectAndStart(tabId: number, allFrames: boolean, frameIds?: number[]) 
   }).catch(() => {});
 }
 
+function getOrigin(url: string): string {
+  try { return new URL(url).origin; } catch { return ''; }
+}
+
 chrome.webNavigation?.onDOMContentLoaded?.addListener((details) => {
   if (!state.isRecording || details.tabId !== activeTabId) return;
   if (details.frameId === 0) {
     injectAndStart(details.tabId, true);
   } else {
     injectAndStart(details.tabId, false, [details.frameId]);
+  }
+});
+
+chrome.webNavigation?.onCompleted?.addListener(async (details) => {
+  if (!state.isRecording || details.tabId !== activeTabId || details.frameId !== 0) return;
+
+  const newUrl = details.url;
+  const oldOrigin = getOrigin(lastKnownUrl);
+  const newOrigin = getOrigin(newUrl);
+
+  if (oldOrigin && newOrigin && oldOrigin !== newOrigin) {
+    lastKnownUrl = newUrl;
+
+    // Send START_RECORDING to the declaratively-injected content script
+    try {
+      await chrome.tabs.sendMessage(details.tabId, {
+        type: 'START_RECORDING',
+        payload: getState(),
+      } as ExtensionMessage);
+    } catch {}
+
+    // Wait for page to render, then capture a navigate event with screenshot
+    await new Promise((r) => setTimeout(r, 1500));
+
+    try {
+      const tab = await chrome.tabs.get(details.tabId);
+      const { mainId, altId } = await captureDualScreenshots(undefined, 500);
+
+      const event: RecordedEvent = {
+        id: `nav-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        type: 'navigate',
+        timestamp: Date.now(),
+        url: newUrl,
+        pageTitle: tab?.title || '',
+        metadata: { fromUrl: lastKnownUrl, toUrl: newUrl, newTitle: tab?.title || '' },
+        screenshotId: mainId ?? undefined,
+        altScreenshotId: altId ?? undefined,
+      };
+
+      await enqueueEvent(event);
+    } catch (err) {
+      console.warn('[docext] Cross-origin navigate capture failed:', err);
+    }
+  } else {
+    lastKnownUrl = newUrl;
   }
 });
 

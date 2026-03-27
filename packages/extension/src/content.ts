@@ -86,8 +86,8 @@ function sendEvent(event: RecordedEvent) {
 
 // ── Interactive Element Resolution ──
 
-const CONTAINER_ROLES = new Set(['menu', 'menubar', 'listbox', 'tablist', 'navigation']);
-const CONTAINER_TAGS = new Set(['menu', 'nav', 'ul', 'ol']);
+const CONTAINER_ROLES = new Set(['menu', 'menubar', 'listbox', 'tablist', 'navigation', 'dialog', 'alertdialog']);
+const CONTAINER_TAGS = new Set(['menu', 'nav', 'ul', 'ol', 'dialog']);
 const FORM_FIELD_TAGS = new Set(['input', 'select', 'textarea']);
 
 function hasActionableHints(n: Element): boolean {
@@ -101,6 +101,8 @@ function hasActionableHints(n: Element): boolean {
   );
 }
 
+const VISUAL_ONLY_TAGS = new Set(['svg', 'img', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'use', 'g', 'icon', 'i', 'span']);
+
 function findInteractiveAncestor(el: Element): Element | null {
   let node: Element | null = el;
   let depth = 0;
@@ -112,7 +114,6 @@ function findInteractiveAncestor(el: Element): Element | null {
       const tag = node.tagName.toLowerCase();
       if ((role && CONTAINER_ROLES.has(role)) || CONTAINER_TAGS.has(tag)) {
         if (!hasActionableHints(node)) {
-          if (!weakMatch && isInteractiveElement(node)) weakMatch = node;
           node = node.parentElement;
           depth++;
           continue;
@@ -120,7 +121,14 @@ function findInteractiveAncestor(el: Element): Element | null {
       }
       return node;
     }
-    if (!weakMatch && isInteractiveElement(node)) weakMatch = node;
+    if (isInteractiveElement(node)) {
+      const tag = node.tagName.toLowerCase();
+      if (!weakMatch) {
+        weakMatch = node;
+      } else if (VISUAL_ONLY_TAGS.has(weakMatch.tagName.toLowerCase()) && !VISUAL_ONLY_TAGS.has(tag)) {
+        weakMatch = node;
+      }
+    }
     node = node.parentElement;
     depth++;
   }
@@ -146,9 +154,26 @@ function findPopupTriggerAncestor(el: Element): Element | null {
   return null;
 }
 
+function liftFromVisualElement(el: Element): Element {
+  if (!VISUAL_ONLY_TAGS.has(el.tagName.toLowerCase())) return el;
+  let node = el.parentElement;
+  let depth = 0;
+  while (node && depth < 5) {
+    const tag = node.tagName.toLowerCase();
+    if (tag === 'button' || tag === 'a' || node.getAttribute('role') === 'button' || node.getAttribute('role') === 'link') {
+      return node;
+    }
+    if (!VISUAL_ONLY_TAGS.has(tag) && isInteractiveElement(node)) return node;
+    node = node.parentElement;
+    depth++;
+  }
+  return el;
+}
+
 function resolveClickTarget(rawTarget: Element): Element | null {
   const popupTrigger = findPopupTriggerAncestor(rawTarget);
-  const target = popupTrigger || findInteractiveAncestor(rawTarget) || rawTarget;
+  let target = popupTrigger || findInteractiveAncestor(rawTarget) || rawTarget;
+  target = liftFromVisualElement(target);
   const tag = target.tagName.toLowerCase();
   if (tag === 'html' || tag === 'body') return null;
   if (FORM_FIELD_TAGS.has(tag)) return null;
