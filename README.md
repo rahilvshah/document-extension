@@ -55,6 +55,31 @@ npm run build:extension  # builds the Chrome extension
 5. Reorder, edit, or delete steps as needed
 6. Click **Export ZIP** to download your documentation
 
+## About Theme Flicker (Important)
+
+DocExt captures each visual step in both light and dark mode. To do this, the extension briefly switches the page theme during capture.
+
+- **What you may notice**: a quick light/dark flash right after certain actions (especially clicks in menus, popups, and modals).
+- **Why this happens**: the extension takes two screenshots per visual step (light first, dark second), then restores the original theme.
+- **Why clicks sometimes feel delayed**: for interactive UI (dropdowns, menu items, popup buttons), DocExt temporarily pauses the original click, captures screenshots, then replays the click to preserve accurate "before-action" screenshots.
+- **What is normal**: a short visual flicker and slight interaction delay during recording.
+- **What is not normal**: controls becoming permanently unclickable, action counts increasing rapidly without interaction, or repeated looping captures.
+
+If behavior feels stuck, stop recording and start a fresh session on the current page.
+
+## Behavior Notes (What to Expect)
+
+These behaviors are intentional and help keep screenshots and steps consistent:
+
+- **Visual vs non-visual events**: dual-theme screenshots are prioritized for visual actions (clicks, modal open/close, page navigation). Text/select/submit events may be recorded without full dual capture to reduce noise and extra flicker.
+- **Typing order around clicks**: pending text input is flushed before a click on another control (for example, clicking **Save** after editing a field), so the typed step appears before the save/click step.
+- **Submit deduping**: if a submit fires immediately after a captured click, DocExt may treat it as the same user intent to avoid duplicate steps.
+- **Highlight targeting is best-effort**: DocExt prefers the clicked control, but highly nested custom UI components can still occasionally highlight a text wrapper or nearby interactive parent.
+- **Cross-origin navigation capture**: when moving between different origins (for example, app -> OAuth provider), navigation capture may appear as its own step and can have a slightly longer settle delay.
+- **Step order stability**: events are uploaded in deterministic order, but very close timestamps from app-side async updates can still create edge-case grouping differences in generated step text.
+
+If a single flow is critical (onboarding, login, checkout), run one clean recording for that flow and avoid switching tabs mid-recording.
+
 ## Development
 
 ```bash
