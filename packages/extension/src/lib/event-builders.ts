@@ -22,6 +22,7 @@ export function buildClickEvent(
   e: MouseEvent | PointerEvent,
   info: ElementInfo,
   domEdits: DomEdit[],
+  opts?: { inEphemeralUI?: boolean },
 ): RecordedEvent {
   const r = el.getBoundingClientRect();
   const cr = findCropContainer(el);
@@ -51,6 +52,7 @@ export function buildClickEvent(
     nearbyText: info.nearbyText,
     viewportHint: info.viewportHint,
     semanticClasses: info.semanticClasses,
+    inEphemeralUI: opts?.inEphemeralUI || undefined,
   };
   return {
     id: generateId(),

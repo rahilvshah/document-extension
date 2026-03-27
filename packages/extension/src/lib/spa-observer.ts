@@ -70,6 +70,16 @@ export function isModalElement(node: HTMLElement): boolean {
   return false;
 }
 
+export function pauseMutationObserver() {
+  if (mutationObserver) mutationObserver.disconnect();
+}
+
+export function resumeMutationObserver() {
+  if (mutationObserver) {
+    mutationObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['open'] });
+  }
+}
+
 export function setupMutationObserver() {
   if (mutationObserver) return;
   mutationObserver = new MutationObserver((mutations) => {
@@ -79,11 +89,13 @@ export function setupMutationObserver() {
       for (const node of mutation.addedNodes) {
         if (!(node instanceof HTMLElement)) continue;
         if (isModalElement(node)) {
+          lastClickSentAt = Date.now();
           sendEventFn?.(buildModalEvent('open', node));
           return;
         }
         const dialog = node.querySelector('[role="dialog"], [role="alertdialog"], dialog, [aria-modal="true"]');
         if (dialog instanceof HTMLElement && isModalElement(dialog)) {
+          lastClickSentAt = Date.now();
           sendEventFn?.(buildModalEvent('open', dialog));
           return;
         }
@@ -92,6 +104,7 @@ export function setupMutationObserver() {
       if (mutation.type === 'attributes' && mutation.target instanceof HTMLElement) {
         const target = mutation.target;
         if (mutation.attributeName === 'open' && target.tagName === 'DIALOG' && target.hasAttribute('open')) {
+          lastClickSentAt = Date.now();
           sendEventFn?.(buildModalEvent('open', target));
         }
       }

@@ -34,6 +34,7 @@ export interface ClickMeta {
   nearbyText?: string;
   viewportHint?: string;
   semanticClasses?: string;
+  inEphemeralUI?: boolean;
 }
 
 export interface InputMeta {

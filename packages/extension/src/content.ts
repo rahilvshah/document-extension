@@ -35,6 +35,8 @@ import {
   startSpaObserver,
   stopSpaObserver,
   setLastClickTimestamp,
+  pauseMutationObserver,
+  resumeMutationObserver,
 } from './lib/spa-observer.js';
 
 // ── State ──
@@ -43,6 +45,8 @@ let isRecording = false;
 let isReplayingClick = false;
 let capturePaused = false;
 let lastClickSentAt = 0;
+const DEBUG_CLICK_PIPELINE = false;
+let gateSafetyTimer: number | null = null;
 
 const CLICK_COOLDOWN_MS = 4000;
 
@@ -67,6 +71,8 @@ let lastPointerCapture: {
   target: Element;
   originalEvent?: PointerEvent;
   didPrevent: boolean;
+  clientX: number;
+  clientY: number;
 } | null = null;
 
 // ── Utilities ──
@@ -79,9 +85,41 @@ function safeSendMessage(msg: ExtensionMessage): Promise<unknown> {
   }
 }
 
+function dbg(...args: unknown[]) {
+  if (!DEBUG_CLICK_PIPELINE) return;
+  const t = Math.round(performance.now());
+  console.log('[docext][content]', t, ...args);
+}
+
 function sendEvent(event: RecordedEvent) {
   if (capturePaused) return;
   safeSendMessage({ type: 'EVENT_CAPTURED', payload: event });
+}
+
+function setMainWorldClickGate(active: boolean) {
+  try {
+    if (gateSafetyTimer !== null) {
+      window.clearTimeout(gateSafetyTimer);
+      gateSafetyTimer = null;
+    }
+    dbg('main-world-gate', active ? 'ON' : 'OFF');
+    window.postMessage({ __docextClickGate: active }, '*');
+    if (active) {
+      // Safety valve: never leave gate stuck ON if a promise chain stalls.
+      gateSafetyTimer = window.setTimeout(() => {
+        window.postMessage({ __docextClickGate: false }, '*');
+        gateSafetyTimer = null;
+      }, 4000);
+    }
+  } catch {}
+}
+
+function releaseGateThenReplay(run: () => void, delayMs = 24) {
+  setMainWorldClickGate(false);
+  // Give page listeners one frame to observe gate release before replay.
+  window.setTimeout(() => {
+    try { run(); } catch {}
+  }, delayMs);
 }
 
 // ── Interactive Element Resolution ──
@@ -172,7 +210,8 @@ function liftFromVisualElement(el: Element): Element {
 
 function resolveClickTarget(rawTarget: Element): Element | null {
   const popupTrigger = findPopupTriggerAncestor(rawTarget);
-  let target = popupTrigger || findInteractiveAncestor(rawTarget) || rawTarget;
+  let target = popupTrigger || findInteractiveAncestor(rawTarget);
+  if (!target) return null;
   target = liftFromVisualElement(target);
   const tag = target.tagName.toLowerCase();
   if (tag === 'html' || tag === 'body') return null;
@@ -182,7 +221,15 @@ function resolveClickTarget(rawTarget: Element): Element | null {
 
 // ── Event Handlers ──
 
+const EPHEMERAL_SELECTORS = '[role="menu"], [role="listbox"], [role="menubar"], [data-radix-menu-content], [data-radix-dropdown-menu-content], [data-radix-select-content], [data-radix-popover-content], [data-radix-dialog-content], [role="dialog"][style*="position"], [role="tooltip"]';
+
+function isInsideEphemeralUI(el: Element): boolean {
+  return !!el.closest(EPHEMERAL_SELECTORS);
+}
+
 function needsPointerdownPrevention(el: Element): boolean {
+  if (isInsideEphemeralUI(el)) return true;
+
   if (el.hasAttribute('aria-haspopup')) return true;
   if (el.getAttribute('aria-expanded') === 'false') return true;
   if (el.getAttribute('data-state') === 'closed') return true;
@@ -197,20 +244,39 @@ function needsPointerdownPrevention(el: Element): boolean {
   return false;
 }
 
-function replayClick(target: Element) {
+function resolveReplayTarget(target: Element, selector?: string, coords?: { x: number; y: number }): Element | null {
+  if (document.contains(target)) return target;
+  if (selector) {
+    const found = document.querySelector(selector);
+    if (found) return found;
+  }
+  if (coords) {
+    const found = document.elementFromPoint(coords.x, coords.y);
+    if (found && found.tagName.toLowerCase() !== 'html' && found.tagName.toLowerCase() !== 'body') return found;
+  }
+  return null;
+}
+
+function replayClick(target: Element, selector?: string, coords?: { x: number; y: number }) {
+  const el = resolveReplayTarget(target, selector, coords);
+  if (!el) return;
+  dbg('replayClick', { selector, tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '' });
   isReplayingClick = true;
   try {
-    if (typeof (target as HTMLElement).click === 'function') {
-      (target as HTMLElement).click();
+    if (typeof (el as HTMLElement).click === 'function') {
+      (el as HTMLElement).click();
     } else {
-      target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
     }
   } finally {
     isReplayingClick = false;
   }
 }
 
-function replayFullChain(target: Element, origPointerEvent: PointerEvent) {
+function replayFullChain(target: Element, origPointerEvent: PointerEvent, selector?: string, coords?: { x: number; y: number }) {
+  const el = resolveReplayTarget(target, selector, coords);
+  if (!el) return;
+  dbg('replayFullChain', { selector, tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '' });
   isReplayingClick = true;
   try {
     const opts = {
@@ -220,12 +286,12 @@ function replayFullChain(target: Element, origPointerEvent: PointerEvent) {
       button: origPointerEvent.button, buttons: origPointerEvent.buttons,
       pointerId: origPointerEvent.pointerId, pointerType: origPointerEvent.pointerType,
     };
-    target.dispatchEvent(new PointerEvent('pointerdown', opts));
-    target.dispatchEvent(new PointerEvent('pointerup', opts));
-    if (typeof (target as HTMLElement).click === 'function') {
-      (target as HTMLElement).click();
+    el.dispatchEvent(new PointerEvent('pointerdown', opts));
+    el.dispatchEvent(new PointerEvent('pointerup', opts));
+    if (typeof (el as HTMLElement).click === 'function') {
+      (el as HTMLElement).click();
     } else {
-      target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
     }
   } finally {
     isReplayingClick = false;
@@ -246,15 +312,26 @@ function handlePointerdown(e: PointerEvent) {
   if (isDuplicateClick(info.selector, Date.now())) return;
 
   const needsPrevent = needsPointerdownPrevention(target);
+  dbg('pointerdown', {
+    tag: target.tagName.toLowerCase(),
+    role: target.getAttribute('role') || '',
+    selector: info.selector,
+    needsPrevent,
+    inEphemeral: isInsideEphemeralUI(target),
+    isTrusted: e.isTrusted,
+  });
   if (needsPrevent) {
-    e.stopPropagation();
+    e.stopImmediatePropagation();
     e.preventDefault();
+    setMainWorldClickGate(true);
   }
 
-  const capturedEvent = buildClickEvent(target, e, info, getDomEdits());
+  const ephemeral = isInsideEphemeralUI(target);
+  const capturedEvent = buildClickEvent(target, e, info, getDomEdits(), { inEphemeralUI: ephemeral || undefined });
   lastClickSentAt = Date.now();
   setLastClickTimestamp(lastClickSentAt);
   const promise = safeSendMessage({ type: 'EVENT_CAPTURED', payload: capturedEvent });
+  promise.then(() => dbg('event-captured-ack', info.selector)).catch(() => dbg('event-captured-ack-failed', info.selector));
 
   lastPointerCapture = {
     selector: info.selector,
@@ -263,13 +340,49 @@ function handlePointerdown(e: PointerEvent) {
     target,
     originalEvent: needsPrevent ? e : undefined,
     didPrevent: needsPrevent,
+    clientX: e.clientX,
+    clientY: e.clientY,
   };
 
   if (needsPrevent) {
+    const sel = info.selector;
+    const fallback = { x: e.clientX, y: e.clientY };
     promise
-      .then(() => { lastClickSentAt = Date.now(); setLastClickTimestamp(lastClickSentAt); replayFullChain(target, e); })
-      .catch(() => { lastClickSentAt = Date.now(); setLastClickTimestamp(lastClickSentAt); replayFullChain(target, e); });
+      .then(() => {
+        releaseGateThenReplay(() => {
+          lastClickSentAt = Date.now();
+          setLastClickTimestamp(lastClickSentAt);
+          replayFullChain(target, e, sel, fallback);
+        }, ephemeral ? 90 : 24);
+      })
+      .catch(() => {
+        releaseGateThenReplay(() => {
+          lastClickSentAt = Date.now();
+          setLastClickTimestamp(lastClickSentAt);
+          replayFullChain(target, e, sel, fallback);
+        }, ephemeral ? 90 : 24);
+      });
   }
+}
+
+function handlePointerup(e: PointerEvent) {
+  if (isReplayingClick) return;
+  if (!isRecording || isEditMode() || capturePaused) return;
+  if (!lastPointerCapture) return;
+
+  const now = Date.now();
+  if (now - lastPointerCapture.time > 1200) return;
+  if (!lastPointerCapture.didPrevent) return;
+  dbg('pointerup-blocked', { selector: lastPointerCapture.selector, isTrusted: e.isTrusted });
+
+  const rawTarget = e.target as Element | null;
+  const toolbar = getToolbarHost();
+  if (rawTarget && toolbar && toolbar.contains(rawTarget)) return;
+
+  // Some UI libraries (e.g. Radix) commit selection on pointerup.
+  // Block pointerup while the screenshot pipeline is in progress.
+  e.preventDefault();
+  e.stopImmediatePropagation();
 }
 
 function handleClick(e: MouseEvent) {
@@ -283,21 +396,26 @@ function handleClick(e: MouseEvent) {
   if (!target) return;
 
   const now = Date.now();
+  dbg('click', { tag: target.tagName.toLowerCase(), role: target.getAttribute('role') || '', isTrusted: e.isTrusted });
 
   if (lastPointerCapture && now - lastPointerCapture.time < 800) {
     e.preventDefault();
-    e.stopPropagation();
+    e.stopImmediatePropagation();
 
     if (lastPointerCapture.didPrevent) {
+      // Keep main-world gate ON. It will be released by the pointerdown
+      // promise branch right before synthetic replay.
       lastPointerCapture = null;
       return;
     }
 
     const capture = lastPointerCapture;
     lastPointerCapture = null;
+    const sel = capture.selector;
+    const fallback = { x: capture.clientX, y: capture.clientY };
     capture.promise
-      .then(() => { lastClickSentAt = Date.now(); setLastClickTimestamp(lastClickSentAt); replayClick(target); })
-      .catch(() => { lastClickSentAt = Date.now(); setLastClickTimestamp(lastClickSentAt); replayClick(target); });
+      .then(() => { lastClickSentAt = Date.now(); setLastClickTimestamp(lastClickSentAt); replayClick(target, sel, fallback); })
+      .catch(() => { lastClickSentAt = Date.now(); setLastClickTimestamp(lastClickSentAt); replayClick(target, sel, fallback); });
     return;
   }
 
@@ -307,17 +425,33 @@ function handleClick(e: MouseEvent) {
   const info = resolveElement(target);
   if (isDuplicateClick(info.selector, now)) return;
 
-  const capturedEvent = buildClickEvent(target, e, info, getDomEdits());
+  const ephemeralFallback = isInsideEphemeralUI(target);
+  const capturedEvent = buildClickEvent(target, e, info, getDomEdits(), { inEphemeralUI: ephemeralFallback || undefined });
   lastClickSentAt = Date.now();
   setLastClickTimestamp(lastClickSentAt);
 
   e.preventDefault();
-  e.stopPropagation();
+  e.stopImmediatePropagation();
+  setMainWorldClickGate(true);
 
   const replayTarget = target;
+  const sel = info.selector;
+  const fallback = { x: e.clientX, y: e.clientY };
   safeSendMessage({ type: 'EVENT_CAPTURED', payload: capturedEvent })
-    .then(() => { lastClickSentAt = Date.now(); setLastClickTimestamp(lastClickSentAt); replayClick(replayTarget); })
-    .catch(() => { lastClickSentAt = Date.now(); setLastClickTimestamp(lastClickSentAt); replayClick(replayTarget); });
+    .then(() => {
+      releaseGateThenReplay(() => {
+        lastClickSentAt = Date.now();
+        setLastClickTimestamp(lastClickSentAt);
+        replayClick(replayTarget, sel, fallback);
+      }, ephemeralFallback ? 90 : 24);
+    })
+    .catch(() => {
+      releaseGateThenReplay(() => {
+        lastClickSentAt = Date.now();
+        setLastClickTimestamp(lastClickSentAt);
+        replayClick(replayTarget, sel, fallback);
+      }, ephemeralFallback ? 90 : 24);
+    });
 }
 
 function handleBlur(e: FocusEvent) {
@@ -368,6 +502,7 @@ function startRecording() {
   lastClickSentAt = 0;
 
   document.addEventListener('pointerdown', handlePointerdown, true);
+  document.addEventListener('pointerup', handlePointerup, true);
   document.addEventListener('click', handleClick, true);
   document.addEventListener('blur', handleBlur, true);
   document.addEventListener('change', handleChange, true);
@@ -399,6 +534,7 @@ function stopRecording() {
   lastPointerCapture = null;
   capturePaused = false;
   document.removeEventListener('pointerdown', handlePointerdown, true);
+  document.removeEventListener('pointerup', handlePointerup, true);
   document.removeEventListener('click', handleClick, true);
   document.removeEventListener('blur', handleBlur, true);
   document.removeEventListener('change', handleChange, true);
@@ -436,15 +572,19 @@ function messageHandler(message: ExtensionMessage, _sender: chrome.runtime.Messa
       break;
     case 'PAUSE_CAPTURE':
       capturePaused = true;
+  setMainWorldClickGate(false);
+      pauseMutationObserver();
       sendResponse({ ok: true });
       break;
     case 'RESUME_CAPTURE':
       capturePaused = false;
+      resumeMutationObserver();
       sendResponse({ ok: true });
       break;
     case 'TOGGLE_THEME': {
       const payload = message.payload as { theme: string } | undefined;
       if (payload) {
+        const savedFocus = document.activeElement;
         const html = document.documentElement;
         if (payload.theme === 'dark') {
           html.classList.add('dark');
@@ -458,6 +598,9 @@ function messageHandler(message: ExtensionMessage, _sender: chrome.runtime.Messa
           html.classList.remove('dark');
           html.removeAttribute('data-theme');
           html.style.colorScheme = '';
+        }
+        if (savedFocus instanceof HTMLElement) {
+          try { savedFocus.focus({ preventScroll: true }); } catch {}
         }
       }
       sendResponse({ ok: true });

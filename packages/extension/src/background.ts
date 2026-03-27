@@ -15,6 +15,13 @@ const NAVIGATE_RENDER_DELAY_MS = 3500;
 
 const eventQueue: Array<{ event: RecordedEvent; resolve: () => void }> = [];
 let processingEvent = false;
+const DEBUG_CLICK_PIPELINE = false;
+
+function dbg(...args: unknown[]) {
+  if (!DEBUG_CLICK_PIPELINE) return;
+  const t = Math.round(performance.now());
+  console.log('[docext][bg]', t, ...args);
+}
 
 async function drainEventQueue() {
   if (processingEvent) return;
@@ -32,6 +39,7 @@ async function drainEventQueue() {
 }
 
 function enqueueEvent(event: RecordedEvent): Promise<void> {
+  dbg('enqueueEvent', event.type, event.id);
   return new Promise<void>((resolve) => {
     eventQueue.push({ event, resolve });
     drainEventQueue();
@@ -278,36 +286,6 @@ async function processScreenshot(blob: Blob, opts?: ScreenshotOpts): Promise<Blo
 
 // ── Toolbar Visibility ──
 
-async function suppressTransitions() {
-  if (!activeTabId) return;
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId: activeTabId },
-      func: () => {
-        let style = document.getElementById('docext-no-transitions');
-        if (!style) {
-          style = document.createElement('style');
-          style.id = 'docext-no-transitions';
-          style.textContent = '*, *::before, *::after { transition: none !important; animation: none !important; }';
-          document.head.appendChild(style);
-        }
-      },
-    });
-  } catch {}
-}
-
-async function restoreTransitions() {
-  if (!activeTabId) return;
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId: activeTabId },
-      func: () => {
-        document.getElementById('docext-no-transitions')?.remove();
-      },
-    });
-  } catch {}
-}
-
 async function hideToolbar() {
   if (!activeTabId) return;
   try {
@@ -344,6 +322,30 @@ async function toWebp(blob: Blob): Promise<Blob> {
   ctx.drawImage(bmp, 0, 0);
   bmp.close();
   return canvas.convertToBlob({ type: 'image/webp', quality: 1 });
+}
+
+// ── Page Observer Pausing ──
+
+async function pausePageObservers() {
+  if (!activeTabId) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: activeTabId },
+      world: 'MAIN',
+      func: () => (window as any).__docext_pauseObservers?.(),
+    });
+  } catch {}
+}
+
+async function resumePageObservers() {
+  if (!activeTabId) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: activeTabId },
+      world: 'MAIN',
+      func: () => (window as any).__docext_resumeObservers?.(),
+    });
+  } catch {}
 }
 
 // ── Theme Toggle ──
@@ -393,10 +395,11 @@ interface RawDualCapture {
   fallbackRaw: Blob | null;
 }
 
-async function captureRawDual(themeSettleMs = 300): Promise<RawDualCapture> {
+async function captureRawDual(themeSettleMs = 300, darkSettleMs = 20): Promise<RawDualCapture> {
   const result: RawDualCapture = { lightRaw: null, darkRaw: null, fallbackRaw: null };
   const originalTheme = state.theme;
-  const fastSettle = Math.min(themeSettleMs, 50);
+  // One paint frame is ~16ms; 20ms gives margin for the browser to repaint
+  const paintFrame = 20;
 
   try {
     await hideToolbar();
@@ -404,26 +407,26 @@ async function captureRawDual(themeSettleMs = 300): Promise<RawDualCapture> {
     if (activeTabId) {
       try {
         await pauseContentCapture();
-        await suppressTransitions();
+        await pausePageObservers();
 
         const needsLightSwitch = originalTheme !== 'light';
         if (needsLightSwitch) {
           await setEmulatedTheme('light');
-          await new Promise((r) => setTimeout(r, fastSettle));
+          await new Promise((r) => setTimeout(r, Math.max(themeSettleMs, paintFrame)));
         }
 
         const lightDataUrl = await chrome.tabs.captureVisibleTab({ format: 'png' });
         result.lightRaw = await (await globalThis.fetch(lightDataUrl)).blob();
 
         await setEmulatedTheme('dark');
-        await new Promise((r) => setTimeout(r, fastSettle));
+        await new Promise((r) => setTimeout(r, Math.max(darkSettleMs, paintFrame)));
 
         const darkDataUrl = await chrome.tabs.captureVisibleTab({ format: 'png' });
         result.darkRaw = await (await globalThis.fetch(darkDataUrl)).blob();
 
         await setEmulatedTheme(originalTheme === 'system' ? 'system' : originalTheme);
-        await new Promise((r) => setTimeout(r, 30));
-        await restoreTransitions();
+        await new Promise((r) => setTimeout(r, paintFrame));
+        await resumePageObservers();
         await resumeContentCapture();
 
         await showToolbar();
@@ -431,7 +434,7 @@ async function captureRawDual(themeSettleMs = 300): Promise<RawDualCapture> {
       } catch (err) {
         console.warn('[docext] Dual-theme capture failed, falling back:', err);
         try { await setEmulatedTheme(originalTheme === 'system' ? 'system' : originalTheme); } catch {}
-        await restoreTransitions();
+        await resumePageObservers();
         await resumeContentCapture();
       }
     }
@@ -490,8 +493,10 @@ async function captureDualScreenshots(
 // ── Event Processing ──
 
 async function handleEventCaptured(event: RecordedEvent) {
+  dbg('handleEventCaptured:start', event.type, event.id);
   const isClick = event.type === 'click';
   const isNavigate = event.type === 'navigate';
+  const isEphemeralClick = isClick && !!(event.metadata as ClickMeta | undefined)?.inEphemeralUI;
   if (event.url) lastKnownUrl = event.url;
 
   try {
@@ -517,7 +522,11 @@ async function handleEventCaptured(event: RecordedEvent) {
       };
     }
 
-    const rawCapture = await captureRawDual(isNavigate ? 800 : 150);
+    const rawCapture = await captureRawDual(
+      isNavigate ? 800 : 150,
+      isEphemeralClick ? 180 : 40,
+    );
+    dbg('captureRawDual:done', event.type, event.id);
 
     const processPromise = (async () => {
       try {
@@ -525,6 +534,7 @@ async function handleEventCaptured(event: RecordedEvent) {
         if (mainId) event.screenshotId = mainId;
         if (altId) event.altScreenshotId = altId;
         await storeEvent(event);
+        dbg('storeEvent:done', event.type, event.id, { screenshotId: !!event.screenshotId, altScreenshotId: !!event.altScreenshotId });
         state.eventCount++;
         broadcastState();
       } catch (err) {
@@ -910,17 +920,28 @@ chrome.webNavigation?.onDOMContentLoaded?.addListener((details) => {
   }
 });
 
+let crossOriginCaptureInProgress = false;
+let lastCrossOriginCaptureAt = 0;
+const CROSS_ORIGIN_COOLDOWN_MS = 5000;
+
 chrome.webNavigation?.onCompleted?.addListener(async (details) => {
   if (!state.isRecording || details.tabId !== activeTabId || details.frameId !== 0) return;
 
   const newUrl = details.url;
   const oldOrigin = getOrigin(lastKnownUrl);
   const newOrigin = getOrigin(newUrl);
+  const prevUrl = lastKnownUrl;
+  lastKnownUrl = newUrl;
 
-  if (oldOrigin && newOrigin && oldOrigin !== newOrigin) {
-    lastKnownUrl = newUrl;
+  if (!oldOrigin || !newOrigin || oldOrigin === newOrigin) return;
+  if (crossOriginCaptureInProgress) return;
+  if (Date.now() - lastCrossOriginCaptureAt < CROSS_ORIGIN_COOLDOWN_MS) return;
 
-    // Send START_RECORDING to the declaratively-injected content script
+  crossOriginCaptureInProgress = true;
+  lastCrossOriginCaptureAt = Date.now();
+
+  try {
+    // Ensure content script is recording on the new page
     try {
       await chrome.tabs.sendMessage(details.tabId, {
         type: 'START_RECORDING',
@@ -928,30 +949,27 @@ chrome.webNavigation?.onCompleted?.addListener(async (details) => {
       } as ExtensionMessage);
     } catch {}
 
-    // Wait for page to render, then capture a navigate event with screenshot
-    await new Promise((r) => setTimeout(r, 1500));
+    await new Promise((r) => setTimeout(r, 800));
+    const tab = await chrome.tabs.get(details.tabId);
 
-    try {
-      const tab = await chrome.tabs.get(details.tabId);
-      const { mainId, altId } = await captureDualScreenshots(undefined, 500);
+    const { mainId, altId } = await captureDualScreenshots(undefined, 500);
 
-      const event: RecordedEvent = {
-        id: `nav-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        type: 'navigate',
-        timestamp: Date.now(),
-        url: newUrl,
-        pageTitle: tab?.title || '',
-        metadata: { fromUrl: lastKnownUrl, toUrl: newUrl, newTitle: tab?.title || '' },
-        screenshotId: mainId ?? undefined,
-        altScreenshotId: altId ?? undefined,
-      };
+    const event: RecordedEvent = {
+      id: `nav-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      type: 'navigate',
+      timestamp: Date.now(),
+      url: newUrl,
+      pageTitle: tab?.title || '',
+      metadata: { fromUrl: prevUrl, toUrl: newUrl, newTitle: tab?.title || '' },
+      screenshotId: mainId ?? undefined,
+      altScreenshotId: altId ?? undefined,
+    };
 
-      await enqueueEvent(event);
-    } catch (err) {
-      console.warn('[docext] Cross-origin navigate capture failed:', err);
-    }
-  } else {
-    lastKnownUrl = newUrl;
+    await enqueueEvent(event);
+  } catch (err) {
+    console.warn('[docext] Cross-origin navigate capture failed:', err);
+  } finally {
+    crossOriginCaptureInProgress = false;
   }
 });
 

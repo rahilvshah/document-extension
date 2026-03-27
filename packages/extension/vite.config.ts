@@ -42,7 +42,7 @@ function wrapIIFE(): Plugin {
         if (chunk.type !== 'chunk') continue;
         if (fileName === 'content.js') {
           chunk.code = `(function(){if(window.__docext_loaded__)return;window.__docext_loaded__=true;${chunk.code}})();\n`;
-        } else if (fileName === 'background.js') {
+        } else if (fileName === 'background.js' || fileName === 'observer-patch.js') {
           chunk.code = `(function(){${chunk.code}})();\n`;
         }
       }
@@ -61,6 +61,7 @@ export default defineConfig({
         popup: resolve(__dirname, 'src/popup/index.html'),
         background: resolve(__dirname, 'src/background.ts'),
         content: resolve(__dirname, 'src/content.ts'),
+        'observer-patch': resolve(__dirname, 'src/observer-patch.ts'),
       },
       output: {
         entryFileNames: '[name].js',
