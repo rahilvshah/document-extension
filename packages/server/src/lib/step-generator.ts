@@ -8,7 +8,15 @@ import type {
   SubmitMeta,
   ModalMeta,
   Step,
+  SubStep,
 } from '@docext/shared';
+
+interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 
 interface RawStep {
   title: string;
@@ -17,6 +25,13 @@ interface RawStep {
   altScreenshotId?: string;
   sourceEventIds: string[];
   timestamp: number;
+  url?: string;
+  elementRect?: Rect;
+  scrollPosition?: { x: number; y: number };
+  viewportSize?: { width: number; height: number };
+  inEphemeralUI?: boolean;
+  containerRole?: string;
+  subSteps?: SubStep[];
 }
 
 function truncate(text: string, max = 50): string {
@@ -382,6 +397,7 @@ export function generateSteps(
     const altScreenshotId = lastEvent.altScreenshotId ?? primaryEvent.altScreenshotId;
     const description = descriptionForEvent(primaryEvent, title);
 
+    const meta = primaryEvent.metadata as ClickMeta & InputMeta & SelectMeta;
     rawSteps.push({
       title,
       description,
@@ -389,6 +405,12 @@ export function generateSteps(
       altScreenshotId,
       sourceEventIds: group.map((e) => e.id),
       timestamp: primaryEvent.timestamp,
+      url: primaryEvent.url,
+      elementRect: meta.elementRect,
+      scrollPosition: meta.scrollPosition,
+      viewportSize: meta.viewportSize,
+      inEphemeralUI: (meta as ClickMeta).inEphemeralUI || undefined,
+      containerRole: (meta as ClickMeta).containerRole || undefined,
     });
   }
 
@@ -438,7 +460,10 @@ export function generateSteps(
     deduped.push(step);
   }
 
-  return deduped.map((raw, idx) => ({
+  const grouped = groupSameAreaSteps(deduped);
+  const merged = mergeTriggerEphemeralPairs(grouped);
+
+  return merged.map((raw, idx) => ({
     id: uuid(),
     sessionId,
     sortOrder: idx,
@@ -448,5 +473,205 @@ export function generateSteps(
     altScreenshotId: raw.altScreenshotId,
     sourceEventIds: raw.sourceEventIds,
     isEdited: false,
+    subSteps: raw.subSteps,
   }));
+}
+
+const SCROLL_THRESHOLD = 50;
+const GROUP_TIME_SPAN_MS = 30_000;
+
+function stripHash(url: string): string {
+  try { return url.split('#')[0]; } catch { return url; }
+}
+
+function groupSameAreaSteps(steps: RawStep[]): RawStep[] {
+  const result: RawStep[] = [];
+  let i = 0;
+
+  while (i < steps.length) {
+    const current = steps[i];
+
+    // Navigate / modal / submit steps and steps without element rects can't be grouped.
+    // Ephemeral steps (popup items, etc.) also can't start a group — their screenshot
+    // shows an overlay that won't be present for any subsequent steps.
+    if (!current.elementRect || !current.url || !current.viewportSize || current.inEphemeralUI) {
+      result.push(current);
+      i++;
+      continue;
+    }
+
+    const group: RawStep[] = [current];
+    let j = i + 1;
+
+    while (j < steps.length) {
+      const candidate = steps[j];
+
+      // Stop grouping at navigate-like steps or steps without rects
+      if (!candidate.elementRect || !candidate.url) break;
+
+      // Ephemeral UI clicks (dropdown items, popups, etc.) were visible only
+      // at the moment of interaction. The group screenshot is taken before
+      // any actions replay, so an ephemeral element won't appear in it —
+      // the annotation would float over empty space.
+      if (candidate.inEphemeralUI) break;
+
+      // Server-side guard: even if inEphemeralUI wasn't set by the content script,
+      // a containerRole of menu/dialog/listbox indicates the element lived inside
+      // an overlay that won't be visible in the group's base screenshot.
+      const OVERLAY_ROLES = new Set(['menu', 'dialog', 'alertdialog', 'listbox', 'tooltip', 'combobox']);
+      if (candidate.containerRole && OVERLAY_ROLES.has(candidate.containerRole)) break;
+
+      // Same page?
+      if (stripHash(candidate.url) !== stripHash(current.url)) break;
+
+      // Time span check
+      if (candidate.timestamp - current.timestamp > GROUP_TIME_SPAN_MS) break;
+
+      // Scroll position check
+      if (current.scrollPosition && candidate.scrollPosition) {
+        const dx = Math.abs(candidate.scrollPosition.x - current.scrollPosition.x);
+        const dy = Math.abs(candidate.scrollPosition.y - current.scrollPosition.y);
+        if (dx > SCROLL_THRESHOLD || dy > SCROLL_THRESHOLD) break;
+      }
+
+      // Check that all elements are visually close to each other (same section/area).
+      // "Fits within the viewport" is too permissive — a sidebar link and a hero button
+      // both fit but are in completely different page regions.
+      // Instead, require every element center to be within MAX_CENTER_DIST_PX of the
+      // first element's center.
+      const MAX_CENTER_DIST_PX = 250;
+      const firstRect = current.elementRect!;
+      const firstCx = firstRect.x + firstRect.width / 2;
+      const firstCy = firstRect.y + firstRect.height / 2;
+      const candRect = candidate.elementRect;
+      const candCx = candRect.x + candRect.width / 2;
+      const candCy = candRect.y + candRect.height / 2;
+      if (Math.hypot(candCx - firstCx, candCy - firstCy) > MAX_CENTER_DIST_PX) break;
+
+      // Look-ahead: if the step immediately AFTER this candidate is a navigate
+      // (no elementRect / url differs), this candidate triggered a navigation —
+      // don't include it in the group so it gets its own step with the correct screenshot.
+      const next = steps[j + 1];
+      const candidateCausesNav =
+        next &&
+        (!next.elementRect ||
+          !next.url ||
+          stripHash(next.url) !== stripHash(current.url));
+      if (candidateCausesNav) break;
+
+      group.push(candidate);
+      j++;
+    }
+
+    if (group.length === 1) {
+      result.push(current);
+      i++;
+      continue;
+    }
+
+    // Merge the group into a compound step
+    const subSteps: SubStep[] = group.map((s) => ({
+      title: s.title,
+      description: s.description,
+      elementRect: s.elementRect,
+    }));
+
+    const firstStep = group[0];
+    const loc = findGroupLocationHint(group);
+    const groupTitle = loc
+      ? `Perform ${group.length} actions ${loc}`
+      : `Perform ${group.length} actions on this page`;
+
+    result.push({
+      title: groupTitle,
+      description: '',
+      // Use the FIRST step's screenshot: it was taken before any action replayed,
+      // so it shows the page state the user sees when starting this sequence.
+      screenshotId: firstStep.screenshotId,
+      altScreenshotId: firstStep.altScreenshotId,
+      sourceEventIds: group.flatMap((s) => s.sourceEventIds),
+      timestamp: group[0].timestamp,
+      url: current.url,
+      elementRect: current.elementRect,
+      viewportSize: current.viewportSize,
+      scrollPosition: current.scrollPosition,
+      subSteps,
+    });
+
+    i = j;
+  }
+
+  return result;
+}
+
+/**
+ * Merge consecutive "trigger → ephemeral" step pairs into one step.
+ *
+ * Example: click "+" (trigger) → click "Add files & photos" in the popup (ephemeral).
+ * Both are on the same page and happen within 10 s. We merge them into one step that:
+ *  - Uses the EPHEMERAL step's screenshot (popup is open, both elements visible).
+ *  - Has numbered sub-steps: 1 = trigger action, 2 = popup action.
+ *  - Sets screenshotId = ephemeral event's screenshot so sessions.ts picks the right image.
+ */
+function mergeTriggerEphemeralPairs(steps: RawStep[]): RawStep[] {
+  const result: RawStep[] = [];
+  let i = 0;
+
+  while (i < steps.length) {
+    const current = steps[i];
+    const next = i + 1 < steps.length ? steps[i + 1] : null;
+
+    if (
+      next &&
+      !current.inEphemeralUI &&
+      current.elementRect &&
+      next.inEphemeralUI &&
+      next.elementRect &&
+      next.url && current.url &&
+      stripHash(next.url) === stripHash(current.url) &&
+      next.timestamp - current.timestamp <= 10_000
+    ) {
+      const subSteps: SubStep[] = [
+        { title: current.title, description: current.description, elementRect: current.elementRect },
+        { title: next.title, description: next.description, elementRect: next.elementRect },
+      ];
+
+      result.push({
+        // Title: the final action is what the user cares about
+        title: next.title,
+        description: next.description,
+        // Use the ephemeral step's screenshot — the popup is open so BOTH elements are visible.
+        screenshotId: next.screenshotId,
+        altScreenshotId: next.altScreenshotId,
+        sourceEventIds: [...current.sourceEventIds, ...next.sourceEventIds],
+        timestamp: current.timestamp,
+        url: current.url,
+        elementRect: next.elementRect,
+        viewportSize: next.viewportSize || current.viewportSize,
+        scrollPosition: next.scrollPosition || current.scrollPosition,
+        subSteps,
+      });
+      i += 2;
+    } else {
+      result.push(current);
+      i++;
+    }
+  }
+
+  return result;
+}
+
+function findGroupLocationHint(group: RawStep[]): string {
+  for (const step of group) {
+    const loc = step.description.match(/Found in (.+?)(?:\.|$)/)?.[1];
+    if (loc) return `in ${loc}`;
+  }
+  // Fall back to extracting location from titles
+  for (const step of group) {
+    const inMatch = step.title.match(/ in the (.+?)$/)?.[1];
+    if (inMatch) return `in the ${inMatch}`;
+    const fromMatch = step.title.match(/ from the (.+?)$/)?.[1];
+    if (fromMatch) return `in the ${fromMatch}`;
+  }
+  return '';
 }

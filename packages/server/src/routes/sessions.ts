@@ -2,15 +2,20 @@ import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
 import { eq, desc, inArray, count } from 'drizzle-orm';
 import multer from 'multer';
+import fsp from 'fs/promises';
 import { db, schema } from '../db/index.js';
 import { generateSteps } from '../lib/step-generator.js';
-import { saveScreenshot, deleteSessionScreenshots } from '../lib/screenshot-store.js';
+import { saveScreenshot, deleteSessionScreenshots, getScreenshotPath } from '../lib/screenshot-store.js';
+import { annotateScreenshot, type Highlight } from '../lib/screenshot-annotator.js';
 import { toStep } from '../lib/mappers.js';
 import type {
   RecordedEvent,
   CreateSessionRequest,
   BatchEventsRequest,
   UpdateStepsRequest,
+  ClickMeta,
+  InputMeta,
+  SelectMeta,
   Step,
 } from '@docext/shared';
 
@@ -209,7 +214,7 @@ sessionsRouter.post('/:id/screenshots', upload.single('screenshot'), async (req,
   }
 });
 
-// Finalize session: generate steps from events
+// Finalize session: generate steps from events, annotate screenshots server-side
 sessionsRouter.post('/:id/finalize', async (req, res) => {
   try {
     const session = await db.query.sessions.findFirst({
@@ -237,15 +242,103 @@ sessionsRouter.post('/:id/finalize', async (req, res) => {
       metadata: JSON.parse(r.metadata),
     }));
 
+    const eventById = new Map(events.map((e) => [e.id, e]));
+
     await db.delete(schema.steps).where(eq(schema.steps.sessionId, req.params.id));
 
     const steps = generateSteps(req.params.id, events);
+
+    // Annotate screenshots server-side
+    for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+      const step = steps[stepIdx];
+      const sourceEvents = step.sourceEventIds
+        .map((id) => eventById.get(id))
+        .filter((e): e is RecordedEvent => !!e);
+
+      if (sourceEvents.length === 0) continue;
+
+      const isGrouped = step.subSteps && step.subSteps.length > 1;
+      const isFirstStep = stepIdx === 0;
+
+      // Collect element rects and viewport info
+      type MetaWithRect = ClickMeta | InputMeta | SelectMeta;
+      const rects: Array<{ x: number; y: number; width: number; height: number }> = [];
+      let viewportWidth = 0;
+      let viewportHeight = 0;
+
+      if (isGrouped && step.subSteps) {
+        // For grouped steps, map sub-steps back to their source events to respect skipHighlight
+        for (let si = 0; si < step.subSteps.length; si++) {
+          const sub = step.subSteps[si];
+          const srcEv = sourceEvents[si];
+          const meta = srcEv?.metadata as MetaWithRect | undefined;
+          if (sub.elementRect && !(meta as ClickMeta)?.skipHighlight) {
+            rects.push(sub.elementRect);
+          }
+        }
+      } else {
+        for (const ev of sourceEvents) {
+          const meta = ev.metadata as MetaWithRect;
+          if ((meta as ClickMeta).skipHighlight) break; // user opted out
+          if (meta.elementRect) {
+            rects.push(meta.elementRect);
+            break;
+          }
+        }
+      }
+
+      // Get viewport size from any source event
+      for (const ev of sourceEvents) {
+        const meta = ev.metadata as MetaWithRect;
+        if (meta.viewportSize) {
+          viewportWidth = meta.viewportSize.width;
+          viewportHeight = meta.viewportSize.height;
+          break;
+        }
+      }
+
+      if (rects.length === 0 || !viewportWidth || !viewportHeight) continue;
+
+      // Build highlights
+      const highlights: Highlight[] = rects.map((rect, idx) => ({
+        rect,
+        number: isGrouped ? idx + 1 : undefined,
+      }));
+
+      // Find the raw screenshot to annotate.
+      // step.screenshotId (set by step-generator) pinpoints the exact event whose
+      // screenshot we want — this is crucial for trigger+ephemeral merges where we
+      // need the LAST event's screenshot (popup open), not the first.
+      const screenshotEvent =
+        (step.screenshotId && sourceEvents.find((e) => e.screenshotId === step.screenshotId)) ||
+        sourceEvents.find((e) => e.screenshotId);
+      const altScreenshotEvent =
+        (step.altScreenshotId && sourceEvents.find((e) => e.altScreenshotId === step.altScreenshotId)) ||
+        sourceEvents.find((e) => e.altScreenshotId);
+
+      // Annotate light screenshot
+      if (screenshotEvent?.screenshotId) {
+        const annotatedId = await annotateAndSave(
+          req.params.id, screenshotEvent.screenshotId, highlights, viewportWidth, viewportHeight, isFirstStep,
+        );
+        if (annotatedId) step.screenshotId = annotatedId;
+      }
+
+      // Annotate dark screenshot
+      if (altScreenshotEvent?.altScreenshotId) {
+        const annotatedId = await annotateAndSave(
+          req.params.id, altScreenshotEvent.altScreenshotId, highlights, viewportWidth, viewportHeight, isFirstStep,
+        );
+        if (annotatedId) step.altScreenshotId = annotatedId;
+      }
+    }
 
     if (steps.length > 0) {
       await db.insert(schema.steps).values(
         steps.map((s) => ({
           ...s,
           sourceEventIds: JSON.stringify(s.sourceEventIds),
+          subSteps: JSON.stringify(s.subSteps || []),
           isEdited: s.isEdited,
         }))
       );
@@ -262,6 +355,45 @@ sessionsRouter.post('/:id/finalize', async (req, res) => {
     res.status(500).json({ error: 'Failed to finalize session' });
   }
 });
+
+async function annotateAndSave(
+  sessionId: string,
+  rawScreenshotId: string,
+  highlights: Highlight[],
+  viewportWidth: number,
+  viewportHeight: number,
+  isFirstStep: boolean,
+): Promise<string | null> {
+  try {
+    const ssRow = await db.query.screenshots.findFirst({
+      where: eq(schema.screenshots.id, rawScreenshotId),
+    });
+    if (!ssRow) return null;
+
+    const rawPath = getScreenshotPath(ssRow.filePath);
+    const rawBuffer = await fsp.readFile(rawPath);
+
+    const annotatedBuffer = await annotateScreenshot(rawBuffer, {
+      highlights,
+      viewportWidth,
+      viewportHeight,
+      isFirstStep,
+    });
+
+    const newId = uuid();
+    const filePath = await saveScreenshot(sessionId, newId, annotatedBuffer);
+    await db.insert(schema.screenshots).values({
+      id: newId,
+      sessionId,
+      filePath,
+      createdAt: Date.now(),
+    });
+    return newId;
+  } catch (err) {
+    console.warn('Screenshot annotation failed:', err);
+    return rawScreenshotId;
+  }
+}
 
 // Update steps (reorder, edit text, delete) — batch operations
 sessionsRouter.put('/:id/steps', async (req, res) => {

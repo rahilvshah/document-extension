@@ -34,6 +34,7 @@ export const steps = sqliteTable('steps', {
   screenshotId: text('screenshot_id'),
   altScreenshotId: text('alt_screenshot_id'),
   sourceEventIds: text('source_event_ids').notNull().default('[]'), // JSON array
+  subSteps: text('sub_steps').notNull().default('[]'), // JSON array of SubStep
   isEdited: integer('is_edited', { mode: 'boolean' }).notNull().default(false),
 });
 

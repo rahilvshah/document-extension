@@ -142,6 +142,22 @@ export default memo(function StepCard({
         </div>
       )}
 
+      {/* Sub-steps for grouped actions */}
+      {step.subSteps && step.subSteps.length > 0 && (
+        <div className="px-4 py-3 border-b border-slate-200/60">
+          <ol className="space-y-1.5">
+            {step.subSteps.map((sub, subIdx) => (
+              <li key={subIdx} className="flex items-start gap-2 text-sm">
+                <span className="w-5 h-5 rounded-full bg-orange-500 text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0 mt-0.5">
+                  {subIdx + 1}
+                </span>
+                <span className="text-slate-700">{sub.title}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+
       {/* Description below screenshot */}
       <div className="px-4 py-3">
         {editingField === 'description' ? (

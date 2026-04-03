@@ -30,6 +30,8 @@ import {
   getToolbarHost,
   hideToolbar,
   showToolbar,
+  showHighlightPrompt,
+  hideHighlightPrompt,
 } from './lib/floating-toolbar.js';
 import {
   startSpaObserver,
@@ -47,8 +49,6 @@ let capturePaused = false;
 let lastClickSentAt = 0;
 const DEBUG_CLICK_PIPELINE = false;
 let gateSafetyTimer: number | null = null;
-
-const CLICK_COOLDOWN_MS = 4000;
 
 // Guard against duplicate script injection
 const INJECTED_KEY = '__docext_injected';
@@ -106,10 +106,11 @@ function setMainWorldClickGate(active: boolean) {
     window.postMessage({ __docextClickGate: active }, '*');
     if (active) {
       // Safety valve: never leave gate stuck ON if a promise chain stalls.
+      // Must be longer than the highlight-prompt auto-dismiss (4000ms) + full BG pipeline (~800ms).
       gateSafetyTimer = window.setTimeout(() => {
         window.postMessage({ __docextClickGate: false }, '*');
         gateSafetyTimer = null;
-      }, 4000);
+      }, 6000);
     }
   } catch {}
 }
@@ -122,7 +123,11 @@ function releaseGateThenReplay(run: () => void, delayMs = 24) {
   }, delayMs);
 }
 
-// ── Interactive Element Resolution ──
+function isInsideToolbar(e: Event): boolean {
+  const toolbar = getToolbarHost();
+  if (!toolbar) return false;
+  return e.composedPath().includes(toolbar);
+}
 
 const CONTAINER_ROLES = new Set(['menu', 'menubar', 'listbox', 'tablist', 'navigation', 'dialog', 'alertdialog']);
 const CONTAINER_TAGS = new Set(['menu', 'nav', 'ul', 'ol', 'dialog']);
@@ -221,24 +226,77 @@ function resolveClickTarget(rawTarget: Element): Element | null {
 
 // ── Event Handlers ──
 
-const EPHEMERAL_SELECTORS = '[role="menu"], [role="listbox"], [role="menubar"], [data-radix-menu-content], [data-radix-dropdown-menu-content], [data-radix-select-content], [data-radix-popover-content], [data-radix-dialog-content], [role="dialog"][style*="position"], [role="tooltip"]';
+const EPHEMERAL_SELECTORS = [
+  // ARIA roles
+  '[role="menu"]',
+  '[role="listbox"]',
+  '[role="option"]',
+  '[role="menubar"]',
+  '[role="tooltip"]',
+  '[role="dialog"][style*="position"]',
+  '[aria-modal="true"]',
+  // Radix UI
+  '[data-radix-menu-content]',
+  '[data-radix-dropdown-menu-content]',
+  '[data-radix-select-content]',
+  '[data-radix-popover-content]',
+  '[data-radix-dialog-content]',
+  '[data-radix-tooltip-content]',
+  // Floating UI / Popper.js
+  '[data-floating-ui-portal]',
+  '[data-popper-placement]',
+  // Headless UI
+  '[data-headlessui-state]',
+  // Tippy.js
+  '.tippy-box',
+  // Native HTML popover
+  '[popover]',
+  // Generic: any element with [data-state="open"] that is also positioned
+  // (covers many React-based dropdown/combobox implementations)
+  '[data-state="open"][style*="position"]',
+].join(', ');
 
 function isInsideEphemeralUI(el: Element): boolean {
-  return !!el.closest(EPHEMERAL_SELECTORS);
-}
+  if (el.closest(EPHEMERAL_SELECTORS)) return true;
 
-function needsPointerdownPrevention(el: Element): boolean {
-  if (isInsideEphemeralUI(el)) return true;
+  // Fallback 1: React portals render overlays as direct children of <body>
+  // with fixed/absolute positioning.
+  let node: Element | null = el.parentElement;
+  while (node && node !== document.documentElement) {
+    const parent = node.parentElement;
+    if (parent === document.body) {
+      const cs = window.getComputedStyle(node);
+      const pos = cs.position;
+      const display = cs.display;
+      const visibility = cs.visibility;
+      if (
+        (pos === 'fixed' || pos === 'absolute') &&
+        display !== 'none' &&
+        visibility !== 'hidden'
+      ) {
+        return true;
+      }
+    }
+    node = parent;
+  }
 
-  if (el.hasAttribute('aria-haspopup')) return true;
-  if (el.getAttribute('aria-expanded') === 'false') return true;
-  if (el.getAttribute('data-state') === 'closed') return true;
-
-  const role = el.getAttribute('role');
-  if (role === 'menuitem' || role === 'menuitemcheckbox' || role === 'menuitemradio' || role === 'option') return true;
-
-  if (el.closest('[role="menu"], [role="listbox"], [role="menubar"], [data-radix-menu-content], [data-radix-dropdown-menu-content], [data-radix-select-content]')) {
-    return true;
+  // Fallback 2: inline (non-portal) popups — absolutely/fixed positioned
+  // ancestor with a z-index that puts it in the overlay layer (≥ 100).
+  // Sticky nav bars and sidebars rarely have z-index that high AND have
+  // interactive items worth clicking mid-sequence.
+  node = el.parentElement;
+  while (node && node !== document.documentElement && node !== document.body) {
+    const cs = window.getComputedStyle(node);
+    const zi = parseInt(cs.zIndex, 10);
+    if (
+      !isNaN(zi) && zi >= 100 &&
+      (cs.position === 'fixed' || cs.position === 'absolute') &&
+      cs.display !== 'none' &&
+      cs.visibility !== 'hidden'
+    ) {
+      return true;
+    }
+    node = node.parentElement;
   }
 
   return false;
@@ -302,8 +360,7 @@ function handlePointerdown(e: PointerEvent) {
   if (isReplayingClick) return;
   if (!isRecording || isEditMode() || capturePaused) return;
   const rawTarget = e.target as Element;
-  const toolbar = getToolbarHost();
-  if (!rawTarget || (toolbar && toolbar.contains(rawTarget))) return;
+  if (!rawTarget || isInsideToolbar(e)) return;
 
   const target = resolveClickTarget(rawTarget);
   if (!target) return;
@@ -323,7 +380,14 @@ function handlePointerdown(e: PointerEvent) {
   const info = resolveElement(target);
   if (isDuplicateClick(info.selector, Date.now())) return;
 
-  const needsPrevent = needsPointerdownPrevention(target);
+  // Always gate and prevent so the screenshot captures pre-click page state.
+  // For needsPrevent targets this was already happening; extending to all
+  // interactive elements ensures focus/hover changes don't pollute the capture.
+  e.stopImmediatePropagation();
+  e.preventDefault();
+  setMainWorldClickGate(true);
+  const needsPrevent = true;
+
   dbg('pointerdown', {
     tag: target.tagName.toLowerCase(),
     role: target.getAttribute('role') || '',
@@ -332,39 +396,51 @@ function handlePointerdown(e: PointerEvent) {
     inEphemeral: isInsideEphemeralUI(target),
     isTrusted: e.isTrusted,
   });
-  if (needsPrevent) {
-    e.stopImmediatePropagation();
-    e.preventDefault();
-    setMainWorldClickGate(true);
-  }
 
   const ephemeral = isInsideEphemeralUI(target);
   const capturedEvent = buildClickEvent(target, e, info, getDomEdits(), { inEphemeralUI: ephemeral || undefined });
-  lastClickSentAt = Date.now();
-  setLastClickTimestamp(lastClickSentAt);
-  const promise = safeSendMessage({ type: 'EVENT_CAPTURED', payload: capturedEvent });
-  promise.then(() => dbg('event-captured-ack', info.selector)).catch(() => dbg('event-captured-ack-failed', info.selector));
+  const label = info.text || info.ariaLabel || info.fieldLabel || info.selector;
 
-  lastPointerCapture = {
-    selector: info.selector,
-    time: Date.now(),
-    promise,
-    target,
-    originalEvent: needsPrevent ? e : undefined,
-    didPrevent: needsPrevent,
-    clientX: e.clientX,
-    clientY: e.clientY,
-  };
+  const dispatchAndReplay = (ev: typeof capturedEvent) => {
+    lastClickSentAt = Date.now();
+    setLastClickTimestamp(lastClickSentAt);
+    const promise = safeSendMessage({ type: 'EVENT_CAPTURED', payload: ev });
+    promise.then(() => dbg('event-captured-ack', info.selector)).catch(() => dbg('event-captured-ack-failed', info.selector));
 
-  if (needsPrevent) {
+    lastPointerCapture = {
+      selector: info.selector,
+      time: Date.now(),
+      promise,
+      target,
+      originalEvent: needsPrevent ? e : undefined,
+      didPrevent: needsPrevent,
+      clientX: e.clientX,
+      clientY: e.clientY,
+    };
+
     const sel = info.selector;
     const fallback = { x: e.clientX, y: e.clientY };
+    const eventId = ev.id;
+
+    const afterReplay = () => {
+      // Screenshot already captured — prompt is purely an annotation decision.
+      // Show after replay so ephemeral UI (hover menus, sidebars) has closed naturally.
+      if (isTopFrame) {
+        showHighlightPrompt(
+          label,
+          () => {}, // Yes: default — screenshot will be annotated
+          () => safeSendMessage({ type: 'SET_SKIP_HIGHLIGHT', payload: { eventId } }),
+        );
+      }
+    };
+
     promise
       .then(() => {
         releaseGateThenReplay(() => {
           lastClickSentAt = Date.now();
           setLastClickTimestamp(lastClickSentAt);
           replayFullChain(target, e, sel, fallback);
+          afterReplay();
         }, ephemeral ? 90 : 24);
       })
       .catch(() => {
@@ -372,9 +448,12 @@ function handlePointerdown(e: PointerEvent) {
           lastClickSentAt = Date.now();
           setLastClickTimestamp(lastClickSentAt);
           replayFullChain(target, e, sel, fallback);
+          afterReplay();
         }, ephemeral ? 90 : 24);
       });
-  }
+  };
+
+  dispatchAndReplay(capturedEvent);
 }
 
 function handlePointerup(e: PointerEvent) {
@@ -388,8 +467,7 @@ function handlePointerup(e: PointerEvent) {
   dbg('pointerup-blocked', { selector: lastPointerCapture.selector, isTrusted: e.isTrusted });
 
   const rawTarget = e.target as Element | null;
-  const toolbar = getToolbarHost();
-  if (rawTarget && toolbar && toolbar.contains(rawTarget)) return;
+  if (rawTarget && isInsideToolbar(e)) return;
 
   // Some UI libraries (e.g. Radix) commit selection on pointerup.
   // Block pointerup while the screenshot pipeline is in progress.
@@ -401,8 +479,7 @@ function handleClick(e: MouseEvent) {
   if (isReplayingClick) return;
   if (!isRecording || isEditMode()) return;
   const rawTarget = e.target as Element;
-  const toolbar = getToolbarHost();
-  if (!rawTarget || (toolbar && toolbar.contains(rawTarget))) return;
+  if (!rawTarget || isInsideToolbar(e)) return;
 
   const target = resolveClickTarget(rawTarget);
   if (!target) return;
@@ -413,21 +490,9 @@ function handleClick(e: MouseEvent) {
   if (lastPointerCapture && now - lastPointerCapture.time < 800) {
     e.preventDefault();
     e.stopImmediatePropagation();
-
-    if (lastPointerCapture.didPrevent) {
-      // Keep main-world gate ON. It will be released by the pointerdown
-      // promise branch right before synthetic replay.
-      lastPointerCapture = null;
-      return;
-    }
-
-    const capture = lastPointerCapture;
+    // didPrevent is always true now (gate+prevent on all interactive pointerdowns).
+    // Release any stale lastPointerCapture; replay is handled by dispatchAndReplay.
     lastPointerCapture = null;
-    const sel = capture.selector;
-    const fallback = { x: capture.clientX, y: capture.clientY };
-    capture.promise
-      .then(() => { lastClickSentAt = Date.now(); setLastClickTimestamp(lastClickSentAt); replayClick(target, sel, fallback); })
-      .catch(() => { lastClickSentAt = Date.now(); setLastClickTimestamp(lastClickSentAt); replayClick(target, sel, fallback); });
     return;
   }
 
@@ -439,8 +504,7 @@ function handleClick(e: MouseEvent) {
 
   const ephemeralFallback = isInsideEphemeralUI(target);
   const capturedEvent = buildClickEvent(target, e, info, getDomEdits(), { inEphemeralUI: ephemeralFallback || undefined });
-  lastClickSentAt = Date.now();
-  setLastClickTimestamp(lastClickSentAt);
+  const label = info.text || info.ariaLabel || info.fieldLabel || info.selector;
 
   e.preventDefault();
   e.stopImmediatePropagation();
@@ -449,12 +513,23 @@ function handleClick(e: MouseEvent) {
   const replayTarget = target;
   const sel = info.selector;
   const fallback = { x: e.clientX, y: e.clientY };
+  const eventId = capturedEvent.id;
+
+  lastClickSentAt = Date.now();
+  setLastClickTimestamp(lastClickSentAt);
   safeSendMessage({ type: 'EVENT_CAPTURED', payload: capturedEvent })
     .then(() => {
       releaseGateThenReplay(() => {
         lastClickSentAt = Date.now();
         setLastClickTimestamp(lastClickSentAt);
         replayClick(replayTarget, sel, fallback);
+        if (isTopFrame) {
+          showHighlightPrompt(
+            label,
+            () => {},
+            () => safeSendMessage({ type: 'SET_SKIP_HIGHLIGHT', payload: { eventId } }),
+          );
+        }
       }, ephemeralFallback ? 90 : 24);
     })
     .catch(() => {
@@ -462,6 +537,13 @@ function handleClick(e: MouseEvent) {
         lastClickSentAt = Date.now();
         setLastClickTimestamp(lastClickSentAt);
         replayClick(replayTarget, sel, fallback);
+        if (isTopFrame) {
+          showHighlightPrompt(
+            label,
+            () => {},
+            () => safeSendMessage({ type: 'SET_SKIP_HIGHLIGHT', payload: { eventId } }),
+          );
+        }
       }, ephemeralFallback ? 90 : 24);
     });
 }
@@ -564,6 +646,7 @@ function stopRecording() {
     flushAllPending(sendEvent);
     resetFilters();
     stopToolbarTimer();
+    hideHighlightPrompt();
     destroyFloatingToolbar();
   }
 }

@@ -35,6 +35,8 @@ export interface ClickMeta {
   viewportHint?: string;
   semanticClasses?: string;
   inEphemeralUI?: boolean;
+  scrollPosition?: { x: number; y: number };
+  skipHighlight?: boolean;
 }
 
 export interface InputMeta {
@@ -52,6 +54,7 @@ export interface InputMeta {
   viewportSize?: { width: number; height: number };
   parentId?: string;
   listPosition?: string;
+  scrollPosition?: { x: number; y: number };
 }
 
 export interface SelectMeta {
@@ -67,6 +70,7 @@ export interface SelectMeta {
   viewportSize?: { width: number; height: number };
   parentId?: string;
   listPosition?: string;
+  scrollPosition?: { x: number; y: number };
 }
 
 export interface NavigateMeta {
@@ -127,6 +131,12 @@ export interface Session {
 
 // ── Step ──
 
+export interface SubStep {
+  title: string;
+  description: string;
+  elementRect?: { x: number; y: number; width: number; height: number };
+}
+
 export interface Step {
   id: string;
   sessionId: string;
@@ -137,6 +147,7 @@ export interface Step {
   altScreenshotId?: string;
   sourceEventIds: string[];
   isEdited: boolean;
+  subSteps?: SubStep[];
 }
 
 // ── API Request/Response Shapes ──
@@ -168,6 +179,7 @@ export type ExtensionMessageType =
   | 'CANCEL_RECORDING'
   | 'RECORDING_STATE'
   | 'EVENT_CAPTURED'
+  | 'SET_SKIP_HIGHLIGHT'
   | 'ENTER_EDIT_MODE'
   | 'EXIT_EDIT_MODE'
   | 'TOGGLE_THEME'

@@ -17,6 +17,9 @@ const LOGO_SVG_HTML = `
 let toolbarHost: HTMLElement | null = null;
 let toolbarShadow: ShadowRoot | null = null;
 let toolbarTimer: ReturnType<typeof setInterval> | null = null;
+let promptDismissTimer: ReturnType<typeof setTimeout> | null = null;
+let promptOnYes: (() => void) | null = null;
+let promptOnNo: (() => void) | null = null;
 
 export function getToolbarHost(): HTMLElement | null {
   return toolbarHost;
@@ -42,6 +45,12 @@ export function createFloatingToolbar(editMode: boolean, onEditToggle: () => voi
     <style>
       :host { all: initial; }
       * { box-sizing: border-box; margin: 0; padding: 0; }
+      .wrap {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 6px;
+      }
       .bar {
         display: flex;
         align-items: center;
@@ -55,6 +64,39 @@ export function createFloatingToolbar(editMode: boolean, onEditToggle: () => voi
         font-size: 13px;
         color: #334155;
         user-select: none;
+      }
+      .confirm-row {
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 14px;
+        background: #fff;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
+        box-shadow: 0 4px 16px rgba(99,102,241,0.10), 0 1px 3px rgba(0,0,0,0.05);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-size: 12px;
+        color: #475569;
+        user-select: none;
+        white-space: nowrap;
+        animation: slide-up 0.15s ease-out;
+      }
+      .confirm-row.visible { display: flex; }
+      @keyframes slide-up {
+        from { opacity: 0; transform: translateY(6px); }
+        to   { opacity: 1; transform: translateY(0); }
+      }
+      .confirm-label {
+        font-weight: 500;
+        color: #334155;
+        max-width: 220px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .confirm-label em {
+        font-style: normal;
+        color: #6366f1;
+        font-weight: 600;
       }
       .logo { width: 24px; height: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
       .rec-dot {
@@ -116,16 +158,39 @@ export function createFloatingToolbar(editMode: boolean, onEditToggle: () => voi
         color: #fff;
         box-shadow: 0 2px 8px rgba(99,102,241,0.2);
       }
+      button.yes-btn {
+        background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);
+        border-color: transparent;
+        color: #fff;
+        font-weight: 600;
+        padding: 4px 11px;
+        box-shadow: 0 2px 6px rgba(34,197,94,0.2);
+      }
+      button.yes-btn:hover { opacity: 0.9; }
+      button.no-btn {
+        background: #f8fafc;
+        color: #64748b;
+        border-color: #cbd5e1;
+        padding: 4px 11px;
+      }
+      button.no-btn:hover { background: #fee2e2; border-color: #fca5a5; color: #dc2626; }
     </style>
-    <div class="bar">
-      <span class="logo">${LOGO_SVG_HTML}</span>
-      <span class="rec-dot"></span>
-      <span class="info" id="info">0:00 · 0 actions</span>
-      <div class="sep"></div>
-      <button id="edit">${editMode ? '✎ Done Editing' : '✎ Edit Page'}</button>
-      <div class="sep"></div>
-      <button id="cancel" class="cancel">✕ Cancel</button>
-      <button id="stop" class="stop">■ Stop</button>
+    <div class="wrap">
+      <div class="confirm-row" id="confirm-row">
+        <span class="confirm-label" id="confirm-label">Highlight this?</span>
+        <button class="yes-btn" id="confirm-yes">✓ Keep</button>
+        <button class="no-btn" id="confirm-no">✗ Skip</button>
+      </div>
+      <div class="bar">
+        <span class="logo">${LOGO_SVG_HTML}</span>
+        <span class="rec-dot"></span>
+        <span class="info" id="info">0:00 · 0 actions</span>
+        <div class="sep"></div>
+        <button id="edit">${editMode ? '✎ Done Editing' : '✎ Edit Page'}</button>
+        <div class="sep"></div>
+        <button id="cancel" class="cancel">✕ Cancel</button>
+        <button id="stop" class="stop">■ Stop</button>
+      </div>
     </div>
   `;
 
@@ -137,7 +202,65 @@ export function createFloatingToolbar(editMode: boolean, onEditToggle: () => voi
   });
   toolbarShadow.getElementById('edit')!.addEventListener('click', onEditToggle);
 
+  toolbarShadow.getElementById('confirm-yes')!.addEventListener('click', () => {
+    const cb = promptOnYes;
+    hideHighlightPrompt();
+    cb?.();
+  });
+  toolbarShadow.getElementById('confirm-no')!.addEventListener('click', () => {
+    const cb = promptOnNo;
+    hideHighlightPrompt();
+    cb?.();
+  });
+
   document.documentElement.appendChild(toolbarHost);
+}
+
+export function showHighlightPrompt(label: string, onYes: () => void, onNo: () => void) {
+  if (!toolbarShadow) { onYes(); return; }
+
+  // Clear any previous pending prompt (treat as "Yes")
+  if (promptOnYes) {
+    const prev = promptOnYes;
+    promptOnYes = null;
+    promptOnNo = null;
+    clearPromptTimer();
+    prev();
+  }
+
+  promptOnYes = onYes;
+  promptOnNo = onNo;
+
+  const row = toolbarShadow.getElementById('confirm-row');
+  const labelEl = toolbarShadow.getElementById('confirm-label');
+  if (row) row.classList.add('visible');
+  if (labelEl) {
+    const short = label.length > 30 ? label.slice(0, 28) + '…' : label;
+    labelEl.innerHTML = `Annotate <em>${short}</em>?`;
+  }
+
+  // Auto-dismiss after 4s and treat as "Yes"
+  promptDismissTimer = setTimeout(() => {
+    const cb = promptOnYes;
+    hideHighlightPrompt();
+    cb?.();
+  }, 4000);
+}
+
+export function hideHighlightPrompt() {
+  clearPromptTimer();
+  promptOnYes = null;
+  promptOnNo = null;
+  if (!toolbarShadow) return;
+  const row = toolbarShadow.getElementById('confirm-row');
+  if (row) row.classList.remove('visible');
+}
+
+function clearPromptTimer() {
+  if (promptDismissTimer !== null) {
+    clearTimeout(promptDismissTimer);
+    promptDismissTimer = null;
+  }
 }
 
 export function destroyFloatingToolbar() {

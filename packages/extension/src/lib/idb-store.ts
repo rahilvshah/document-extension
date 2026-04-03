@@ -39,6 +39,24 @@ export async function storeEvent(event: RecordedEvent): Promise<void> {
   });
 }
 
+export async function updateEventSkipHighlight(eventId: string): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(EVENTS_STORE, 'readwrite');
+    const store = tx.objectStore(EVENTS_STORE);
+    const req = store.get(eventId);
+    req.onsuccess = () => {
+      const event = req.result as RecordedEvent | undefined;
+      if (event) {
+        (event.metadata as Record<string, unknown>).skipHighlight = true;
+        store.put(event);
+      }
+      resolve();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
 export async function storeScreenshot(id: string, blob: Blob): Promise<void> {
   const db = await openDB();
   return new Promise((resolve, reject) => {

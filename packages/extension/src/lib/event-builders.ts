@@ -155,6 +155,7 @@ export function buildClickEvent(
     viewportHint: info.viewportHint,
     semanticClasses: info.semanticClasses,
     inEphemeralUI: opts?.inEphemeralUI || undefined,
+    scrollPosition: { x: window.scrollX, y: window.scrollY },
   };
   return {
     id: generateId(),
@@ -193,6 +194,7 @@ export function buildInputEvent(el: Element, info: ElementInfo): RecordedEvent {
     viewportSize: { width: window.innerWidth, height: window.innerHeight },
     parentId: info.parentId,
     listPosition: info.listPosition,
+    scrollPosition: { x: window.scrollX, y: window.scrollY },
   };
   return {
     id: generateId(),
@@ -222,6 +224,7 @@ export function buildSelectEvent(el: HTMLSelectElement, info: ElementInfo): Reco
     viewportSize: { width: window.innerWidth, height: window.innerHeight },
     parentId: info.parentId,
     listPosition: info.listPosition,
+    scrollPosition: { x: window.scrollX, y: window.scrollY },
   };
   return {
     id: generateId(),

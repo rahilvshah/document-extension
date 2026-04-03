@@ -1,12 +1,12 @@
-import type { RecordedEvent, RecordingState, ExtensionMessage, ClickMeta, InputMeta, SelectMeta } from '@docext/shared';
-import { storeEvent, storeScreenshot, getAllEvents, getAllScreenshots, clearAll } from './lib/idb-store.js';
+import type { RecordedEvent, RecordingState, ExtensionMessage, ClickMeta } from '@docext/shared';
+import { storeEvent, updateEventSkipHighlight, storeScreenshot, getAllEvents, getAllScreenshots, clearAll } from './lib/idb-store.js';
 import { createSession, uploadEvents, uploadScreenshotBlob, finalizeSession, deleteSession } from './lib/api-client.js';
 
 // ── Configuration ──
 
 const SCREENSHOT_DELAY_MS = 200;
 const NAVIGATE_LOAD_TIMEOUT_MS = 8000;
-const CLICK_SCREENSHOT_DELAY_MS = 50;
+const CLICK_SCREENSHOT_DELAY_MS = 10;
 const BATCH_INTERVAL_MS = 30_000;
 const UPLOAD_CONCURRENCY = 4;
 const NAVIGATE_RENDER_DELAY_MS = 3500;
@@ -107,181 +107,6 @@ function broadcastState() {
       payload: snapshot,
     } as ExtensionMessage).catch(() => {});
   }
-}
-
-// ── Screenshot Processing ──
-
-interface ScreenshotOpts {
-  crop?: { x: number; y: number; width: number; height: number };
-  highlight?: { x: number; y: number; width: number; height: number };
-  viewportWidth: number;
-  viewportHeight: number;
-}
-
-function canvasToPng(canvas: OffscreenCanvas): Promise<Blob> {
-  return canvas.convertToBlob({ type: 'image/png' });
-}
-
-function drawRoundRect(
-  ctx: OffscreenCanvasRenderingContext2D,
-  x: number, y: number, w: number, h: number, r: number,
-) {
-  r = Math.min(r, w / 2, h / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.arcTo(x + w, y, x + w, y + r, r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
-  ctx.lineTo(x + r, y + h);
-  ctx.arcTo(x, y + h, x, y + h - r, r);
-  ctx.lineTo(x, y + r);
-  ctx.arcTo(x, y, x + r, y, r);
-  ctx.closePath();
-}
-
-function drawHighlight(
-  ctx: OffscreenCanvasRenderingContext2D,
-  ex: number, ey: number, ew: number, eh: number,
-  canvasW: number, canvasH: number, scale: number,
-) {
-  if (ew < 2 || eh < 2) return;
-
-  const pad = 4 * scale;
-  const rx = Math.max(0, ex - pad);
-  const ry = Math.max(0, ey - pad);
-  const rw = Math.min(canvasW - rx, ew + pad * 2);
-  const rh = Math.min(canvasH - ry, eh + pad * 2);
-  const radius = 6 * scale;
-  const lw = 3 * scale;
-
-  ctx.strokeStyle = 'rgba(249,115,22,0.3)';
-  ctx.lineWidth = lw + 4 * scale;
-  drawRoundRect(ctx, rx, ry, rw, rh, radius);
-  ctx.stroke();
-
-  ctx.strokeStyle = '#f97316';
-  ctx.lineWidth = lw;
-  drawRoundRect(ctx, rx, ry, rw, rh, radius);
-  ctx.stroke();
-
-  const spaceR = canvasW - (rx + rw);
-  const spaceL = rx;
-  const spaceT = ry;
-  const spaceB = canvasH - (ry + rh);
-  const best = Math.max(spaceR, spaceL, spaceT, spaceB);
-
-  if (best < 30 * scale) return;
-
-  const arrowLen = Math.min(65 * scale, best * 0.7);
-  const gap = 8 * scale;
-  let tipX: number, tipY: number, startX: number, startY: number, cpX: number, cpY: number;
-
-  if (best === spaceR) {
-    tipX = rx + rw + gap; tipY = ry + rh / 2;
-    startX = tipX + arrowLen; startY = tipY - arrowLen * 0.7;
-    cpX = startX; cpY = tipY;
-  } else if (best === spaceL) {
-    tipX = rx - gap; tipY = ry + rh / 2;
-    startX = tipX - arrowLen; startY = tipY - arrowLen * 0.7;
-    cpX = startX; cpY = tipY;
-  } else if (best === spaceT) {
-    tipX = rx + rw / 2; tipY = ry - gap;
-    startX = tipX + arrowLen * 0.7; startY = tipY - arrowLen;
-    cpX = tipX; cpY = startY;
-  } else {
-    tipX = rx + rw / 2; tipY = ry + rh + gap;
-    startX = tipX + arrowLen * 0.7; startY = tipY + arrowLen;
-    cpX = tipX; cpY = startY;
-  }
-
-  ctx.strokeStyle = '#f97316';
-  ctx.lineWidth = lw;
-  ctx.lineCap = 'round';
-  ctx.beginPath();
-  ctx.moveTo(startX, startY);
-  ctx.quadraticCurveTo(cpX, cpY, tipX, tipY);
-  ctx.stroke();
-
-  const headLen = 12 * scale;
-  const angle = Math.atan2(tipY - cpY, tipX - cpX);
-  ctx.fillStyle = '#f97316';
-  ctx.beginPath();
-  ctx.moveTo(tipX, tipY);
-  ctx.lineTo(tipX - headLen * Math.cos(angle - 0.45), tipY - headLen * Math.sin(angle - 0.45));
-  ctx.lineTo(tipX - headLen * Math.cos(angle + 0.45), tipY - headLen * Math.sin(angle + 0.45));
-  ctx.closePath();
-  ctx.fill();
-}
-
-async function processScreenshot(blob: Blob, opts?: ScreenshotOpts): Promise<Blob> {
-  if (!opts || (!opts.crop && !opts.highlight)) return blob;
-
-  let srcBitmap: ImageBitmap;
-  try {
-    srcBitmap = await createImageBitmap(blob);
-  } catch {
-    return blob;
-  }
-
-  if (srcBitmap.width === 0 || srcBitmap.height === 0) {
-    srcBitmap.close();
-    return blob;
-  }
-
-  const imgScaleX = srcBitmap.width / opts.viewportWidth;
-  const imgScaleY = srcBitmap.height / opts.viewportHeight;
-
-  let sx = 0, sy = 0, sw = srcBitmap.width, sh = srcBitmap.height;
-  let originX = 0, originY = 0;
-
-  if (opts.crop) {
-    const c = opts.crop;
-    const edgePad = 16;
-    let cropLeft = c.x - edgePad;
-    let cropTop = c.y - edgePad;
-    let cropRight = c.x + c.width + edgePad;
-    let cropBottom = c.y + c.height + edgePad;
-
-    if (opts.highlight) {
-      const h = opts.highlight;
-      const hlPad = edgePad + 80;
-      cropLeft = Math.min(cropLeft, h.x - hlPad);
-      cropTop = Math.min(cropTop, h.y - hlPad);
-      cropRight = Math.max(cropRight, h.x + h.width + hlPad);
-      cropBottom = Math.max(cropBottom, h.y + h.height + hlPad);
-    }
-
-    originX = Math.max(0, cropLeft);
-    originY = Math.max(0, cropTop);
-    const clampedRight = Math.min(opts.viewportWidth, cropRight);
-    const clampedBottom = Math.min(opts.viewportHeight, cropBottom);
-    sx = Math.round(originX * imgScaleX);
-    sy = Math.round(originY * imgScaleY);
-    sw = Math.min(srcBitmap.width - sx, Math.round((clampedRight - originX) * imgScaleX));
-    sh = Math.min(srcBitmap.height - sy, Math.round((clampedBottom - originY) * imgScaleY));
-
-    if (sw < 100 || sh < 100) {
-      sx = 0; sy = 0; sw = srcBitmap.width; sh = srcBitmap.height;
-      originX = 0; originY = 0;
-    }
-  }
-
-  const canvas = new OffscreenCanvas(sw, sh);
-  const ctx = canvas.getContext('2d')!;
-  ctx.drawImage(srcBitmap, sx, sy, sw, sh, 0, 0, sw, sh);
-  srcBitmap.close();
-
-  if (opts.highlight) {
-    const h = opts.highlight;
-    const ex = (h.x - originX) * imgScaleX;
-    const ey = (h.y - originY) * imgScaleY;
-    const ew = h.width * imgScaleX;
-    const eh = h.height * imgScaleY;
-    drawHighlight(ctx, ex, ey, ew, eh, sw, sh, imgScaleX);
-  }
-
-  return canvasToPng(canvas);
 }
 
 // ── Toolbar Visibility ──
@@ -396,17 +221,6 @@ async function setEmulatedTheme(theme: 'light' | 'dark' | 'system') {
   state.theme = theme;
 }
 
-async function processPng(rawBlob: Blob, opts?: ScreenshotOpts): Promise<Blob> {
-  if (!opts) return rawBlob;
-  try {
-    const processed = await processScreenshot(rawBlob, opts);
-    if (processed.size > 1000) return processed;
-  } catch (e) {
-    console.warn('[docext] Screenshot processing failed, using full-page:', e);
-  }
-  return rawBlob;
-}
-
 async function storeFinalScreenshot(pngBlob: Blob): Promise<string> {
   const blob = await toWebp(pngBlob);
   const id = `ss-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -431,7 +245,6 @@ async function captureRawDual(themeSettleMs = 300, darkSettleMs = 20): Promise<R
 
     if (activeTabId) {
       try {
-        await pauseContentCapture();
         await pausePageObservers();
 
         const needsLightSwitch = originalTheme !== 'light';
@@ -452,7 +265,6 @@ async function captureRawDual(themeSettleMs = 300, darkSettleMs = 20): Promise<R
         await setEmulatedTheme(originalTheme === 'system' ? 'system' : originalTheme);
         await new Promise((r) => setTimeout(r, paintFrame));
         await resumePageObservers();
-        await resumeContentCapture();
 
         await showToolbar();
         return result;
@@ -460,7 +272,6 @@ async function captureRawDual(themeSettleMs = 300, darkSettleMs = 20): Promise<R
         console.warn('[docext] Dual-theme capture failed, falling back:', err);
         try { await setEmulatedTheme(originalTheme === 'system' ? 'system' : originalTheme); } catch {}
         await resumePageObservers();
-        await resumeContentCapture();
       }
     }
 
@@ -477,28 +288,20 @@ async function captureRawDual(themeSettleMs = 300, darkSettleMs = 20): Promise<R
 
 async function processRawDual(
   raw: RawDualCapture,
-  opts?: ScreenshotOpts,
 ): Promise<{ mainId: string | null; altId: string | null }> {
   let mainId: string | null = null;
   let altId: string | null = null;
 
   try {
     if (raw.lightRaw && raw.darkRaw) {
-      const [lightPng, darkPng] = await Promise.all([
-        processPng(raw.lightRaw, opts),
-        processPng(raw.darkRaw, opts),
-      ]);
-
       const [lId, dId] = await Promise.all([
-        storeFinalScreenshot(lightPng),
-        storeFinalScreenshot(darkPng),
+        storeFinalScreenshot(raw.lightRaw),
+        storeFinalScreenshot(raw.darkRaw),
       ]);
-
       mainId = lId;
       altId = dId;
     } else if (raw.fallbackRaw) {
-      const png = await processPng(raw.fallbackRaw, opts);
-      mainId = await storeFinalScreenshot(png);
+      mainId = await storeFinalScreenshot(raw.fallbackRaw);
     }
   } catch (err) {
     console.warn('[docext] Screenshot processing failed:', err);
@@ -508,11 +311,10 @@ async function processRawDual(
 }
 
 async function captureDualScreenshots(
-  opts?: ScreenshotOpts,
   themeSettleMs = 300,
 ): Promise<{ mainId: string | null; altId: string | null }> {
   const raw = await captureRawDual(themeSettleMs);
-  return processRawDual(raw, opts);
+  return processRawDual(raw);
 }
 
 function sortEventsForUpload(events: RecordedEvent[]): RecordedEvent[] {
@@ -549,29 +351,15 @@ async function handleEventCaptured(event: RecordedEvent) {
       return;
     }
 
-    let opts: ScreenshotOpts | undefined;
-    const meta = event.metadata as ClickMeta | InputMeta | SelectMeta;
-    const hasRect = isClick || event.type === 'input' || event.type === 'select';
-    if (hasRect && meta.viewportSize) {
-      const vp = meta.viewportSize;
-      const shouldCrop = state.eventCount > 0 && (meta.cropRect || meta.elementRect);
-      opts = {
-        crop: shouldCrop ? (meta.cropRect || meta.elementRect) : undefined,
-        highlight: meta.elementRect || undefined,
-        viewportWidth: vp.width,
-        viewportHeight: vp.height,
-      };
-    }
-
     const rawCapture = await captureRawDual(
       isNavigate ? 800 : 150,
-      isEphemeralClick ? 180 : 40,
+      isEphemeralClick ? 300 : 300,
     );
     dbg('captureRawDual:done', event.type, event.id);
 
     const processPromise = (async () => {
       try {
-        const { mainId, altId } = await processRawDual(rawCapture, opts);
+        const { mainId, altId } = await processRawDual(rawCapture);
         if (mainId) event.screenshotId = mainId;
         if (altId) event.altScreenshotId = altId;
         await storeEvent(event);
@@ -657,7 +445,7 @@ async function captureFinalScreenshots(): Promise<void> {
     let tab: chrome.tabs.Tab | undefined;
     try { tab = await chrome.tabs.get(activeTabId); } catch { return; }
 
-    const { mainId: ssId, altId } = await captureDualScreenshots(undefined, 500);
+    const { mainId: ssId, altId } = await captureDualScreenshots(500);
 
     const event: RecordedEvent = {
       id: `final-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -688,17 +476,19 @@ async function stopRecording() {
     batchTimer = null;
   }
 
-  // Wait for any in-progress batch flush to finish
-  await waitForFlush();
-
-  await waitForPendingCaptures();
-  await captureFinalScreenshots();
-
+  // Tell the content script to stop immediately so the toolbar disappears
+  // right when the user clicks Stop, before the async capture/flush work.
   if (activeTabId) {
     try {
       await chrome.tabs.sendMessage(activeTabId, { type: 'STOP_RECORDING' } as ExtensionMessage);
     } catch { /* tab may have closed */ }
   }
+
+  // Wait for any in-progress batch flush to finish
+  await waitForFlush();
+
+  await waitForPendingCaptures();
+  await captureFinalScreenshots();
 
   await forceFlushToBackend();
 
@@ -898,6 +688,11 @@ chrome.runtime.onMessage.addListener(
           await enqueueEvent(event);
           return { ok: true };
         }
+        case 'SET_SKIP_HIGHLIGHT': {
+          const { eventId } = message.payload as { eventId: string };
+          await updateEventSkipHighlight(eventId);
+          return { ok: true };
+        }
         case 'ENTER_EDIT_MODE': {
           state.editMode = true;
           if (activeTabId) {
@@ -997,7 +792,7 @@ chrome.webNavigation?.onCompleted?.addListener(async (details) => {
     await new Promise((r) => setTimeout(r, 800));
     const tab = await chrome.tabs.get(details.tabId);
 
-    const { mainId, altId } = await captureDualScreenshots(undefined, 500);
+    const { mainId, altId } = await captureDualScreenshots(500);
 
     const event: RecordedEvent = {
       id: `nav-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,

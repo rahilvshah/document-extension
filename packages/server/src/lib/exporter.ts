@@ -44,10 +44,19 @@ async function exportHtml(data: ExportData, inline = true): Promise<string> {
       }
     }
 
+    let subStepsHtml = '';
+    if (step.subSteps && step.subSteps.length > 0) {
+      const items = step.subSteps.map((sub, idx) =>
+        `<li style="margin-bottom:4px;"><strong>${idx + 1}.</strong> ${escapeHtml(sub.title)}</li>`
+      ).join('\n');
+      subStepsHtml = `<ol style="padding-left:0;list-style:none;margin:8px 0;">${items}</ol>`;
+    }
+
     stepsHtml.push(`
       <div style="margin-bottom:32px;">
         <h2 style="font-size:1.2em;margin-bottom:8px;">Step ${i + 1}: ${escapeHtml(step.title)}</h2>
         ${step.description ? `<p style="color:#4a5568;margin-bottom:8px;">${escapeHtml(step.description)}</p>` : ''}
+        ${subStepsHtml}
         ${imgTag}
       </div>
     `);
@@ -180,6 +189,13 @@ function buildMarkdownForZip(
 
     if (step.description) {
       lines.push(step.description);
+      lines.push('');
+    }
+
+    if (step.subSteps && step.subSteps.length > 0) {
+      for (let s = 0; s < step.subSteps.length; s++) {
+        lines.push(`${s + 1}. ${step.subSteps[s].title}`);
+      }
       lines.push('');
     }
 

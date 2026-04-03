@@ -59,9 +59,10 @@ sqlite.exec(`
   CREATE INDEX IF NOT EXISTS idx_screenshots_session ON screenshots(session_id);
 `);
 
-// Add alt_screenshot_id columns to existing tables (safe to fail if already present)
+// Add columns to existing tables (safe to fail if already present)
 try { sqlite.exec('ALTER TABLE events ADD COLUMN alt_screenshot_id TEXT'); } catch {}
 try { sqlite.exec('ALTER TABLE steps ADD COLUMN alt_screenshot_id TEXT'); } catch {}
+try { sqlite.exec("ALTER TABLE steps ADD COLUMN sub_steps TEXT NOT NULL DEFAULT '[]'"); } catch {}
 
 export const db = drizzle(sqlite, { schema });
 
