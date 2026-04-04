@@ -121,7 +121,7 @@ function buildNumberedHighlightSvg(
   scaleX: number,
   scaleY: number,
   canvasW: number,
-  _canvasH: number,
+  canvasH: number,
 ): string {
   const pad = 4 * scaleX;
   const r = h.rect;
@@ -132,10 +132,11 @@ function buildNumberedHighlightSvg(
 
   if (ew < 2 || eh < 2) return '';
 
+  // Clamp the highlight box so it never extends outside the canvas.
   const rx = Math.max(0, ex - pad);
   const ry = Math.max(0, ey - pad);
   const rw = Math.min(canvasW - rx, ew + pad * 2);
-  const rh = Math.min(_canvasH - ry, eh + pad * 2);
+  const rh = Math.min(canvasH - ry, eh + pad * 2);
   const radius = 6 * scaleX;
   const lw = 3 * scaleX;
   const cr = CIRCLE_RADIUS * scaleX;
@@ -153,12 +154,38 @@ function buildNumberedHighlightSvg(
     `fill="none" stroke="${HIGHLIGHT_COLOR}" stroke-width="${lw}"/>`
   );
 
-  // Numbered circle at top-right corner of the box
-  let circleX = rx + rw - cr * 0.3;
-  let circleY = ry - cr * 0.3;
-  // Keep circle within canvas bounds
+  // Place the numbered circle at the corner that has the most room.
+  // This prevents clipping when the element is near any edge.
+  const spaceTop = ry;
+  const spaceBottom = canvasH - (ry + rh);
+  const spaceRight = canvasW - (rx + rw);
+
+  let circleX: number;
+  let circleY: number;
+
+  // Prefer top-right; fall back to bottom-right if near top edge.
+  if (spaceTop >= cr * 0.7) {
+    // Enough room above — anchor to top-right corner
+    circleX = rx + rw - cr * 0.3;
+    circleY = ry - cr * 0.7;
+  } else if (spaceBottom >= cr * 0.7) {
+    // Near top edge — anchor to bottom-right corner
+    circleX = rx + rw - cr * 0.3;
+    circleY = ry + rh + cr * 0.7;
+  } else {
+    // No vertical room — float inside the box at top-right
+    circleX = rx + rw - cr - lw;
+    circleY = ry + cr + lw;
+  }
+
+  // If near right edge, shift left
+  if (spaceRight < cr * 0.7) {
+    circleX = rx + rw - cr - lw;
+  }
+
+  // Hard clamp — circle must always be fully inside the canvas
   circleX = Math.min(canvasW - cr - 2, Math.max(cr + 2, circleX));
-  circleY = Math.min(_canvasH - cr - 2, Math.max(cr + 2, circleY));
+  circleY = Math.min(canvasH - cr - 2, Math.max(cr + 2, circleY));
 
   parts.push(
     `<circle cx="${circleX}" cy="${circleY}" r="${cr}" fill="${HIGHLIGHT_COLOR}"/>` +
