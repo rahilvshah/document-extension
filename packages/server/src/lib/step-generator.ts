@@ -39,6 +39,7 @@ interface RawStep {
   inEphemeralUI?: boolean;
   containerRole?: string;
   openOverlays?: string[];
+  dialogName?: string;
   subSteps?: SubStep[];
   mergeWithNextId?: string;
   themeCapture?: 'dual' | 'same';
@@ -115,13 +116,23 @@ function bestLabel(m: ClickMeta): string {
   return '';
 }
 
-function descriptionForAfterOutcome(ao: AfterOutcome): string {
-  if (ao.openOverlayName) {
-    const name = cleanLabel(ao.openOverlayName);
-    if (ao.outcome === 'opened-dialog' || /dialog|modal|popup/i.test(name)) {
-      return `Opens the ${name}`;
-    }
-    return `Opens the ${name}`;
+function descriptionForAfterOutcome(ao: AfterOutcome, alreadyOpen?: string[]): string {
+  const wasOpen = (name: string | undefined) => {
+    if (!name || !alreadyOpen?.length) return false;
+    const key = name.trim().toLowerCase();
+    if (!key) return false;
+    return alreadyOpen.some((n) => {
+      const other = n.trim().toLowerCase();
+      if (!other) return false;
+      if (key === other) return true;
+      if (key.length < 3 || other.length < 3) return false;
+      return key.includes(other) || other.includes(key);
+    });
+  };
+
+  if (ao.outcome === 'opened-dialog' && wasOpen(ao.openOverlayName)) return '';
+  if (ao.openOverlayName && !wasOpen(ao.openOverlayName)) {
+    return `Opens the ${cleanLabel(ao.openOverlayName)}`;
   }
   switch (ao.outcome) {
     case 'expanded':
@@ -282,7 +293,9 @@ function descriptionForEvent(event: RecordedEvent, title: string): string {
     case 'click': {
       const m = meta as ClickMeta;
       if (m.afterOutcome) {
-        const outcomeDesc = descriptionForAfterOutcome(m.afterOutcome);
+        const alreadyOpen = [...(m.openOverlays ?? [])];
+        if (m.dialogName) alreadyOpen.push(m.dialogName);
+        const outcomeDesc = descriptionForAfterOutcome(m.afterOutcome, alreadyOpen);
         if (outcomeDesc) return outcomeDesc;
       }
       if (m.breadcrumb) parts.push(`Found in ${m.breadcrumb}`);
@@ -477,7 +490,8 @@ export function generateSteps(
       inEphemeralUI: (meta as ClickMeta).inEphemeralUI || undefined,
       containerRole: (meta as ClickMeta).containerRole || undefined,
       openOverlays: meta.openOverlays,
-      themeCapture: meta.themeCapture,
+      dialogName: (meta as ClickMeta).dialogName,
+      themeCapture: beforeDarkId || afterDarkId ? 'dual' : meta.themeCapture,
     });
   }
 
@@ -562,8 +576,10 @@ function adoptLaterShots(prev: RawStep, step: RawStep): void {
   if (step.beforeDarkId) prev.beforeDarkId = step.beforeDarkId;
   if (step.afterLightId) prev.afterLightId = step.afterLightId;
   if (step.afterDarkId) prev.afterDarkId = step.afterDarkId;
-  if (step.themeCapture) prev.themeCapture = step.themeCapture;
+  if (prev.altScreenshotId || prev.beforeDarkId || prev.afterDarkId) prev.themeCapture = 'dual';
+  else if (step.themeCapture) prev.themeCapture = step.themeCapture;
   if (!prev.openOverlays?.length && step.openOverlays?.length) prev.openOverlays = step.openOverlays;
+  if (!prev.dialogName && step.dialogName) prev.dialogName = step.dialogName;
 }
 
 const SCROLL_THRESHOLD = 50;
@@ -689,8 +705,11 @@ function groupSameAreaSteps(steps: RawStep[]): RawStep[] {
       elementRect: current.elementRect,
       viewportSize: current.viewportSize,
       scrollPosition: current.scrollPosition,
-      themeCapture: firstStep.themeCapture,
+      themeCapture: firstStep.beforeDarkId || firstStep.afterDarkId || lastStep.beforeDarkId || lastStep.afterDarkId
+        ? 'dual'
+        : (lastStep.themeCapture || firstStep.themeCapture),
       openOverlays: firstStep.openOverlays,
+      dialogName: firstStep.dialogName || lastStep.dialogName,
       subSteps,
     });
 
@@ -719,12 +738,32 @@ function groupSameAreaSteps(steps: RawStep[]): RawStep[] {
  */
 const MERGE_IGNORE_OVERLAYS = new Set(['menu', 'listbox', 'tooltip']);
 
+function dialogKeys(step: RawStep): string[] {
+  const keys = (step.openOverlays ?? [])
+    .map((n) => n.trim().toLowerCase())
+    .filter((n) => n && !MERGE_IGNORE_OVERLAYS.has(n));
+  const dialog = step.dialogName?.trim().toLowerCase();
+  if (dialog && !MERGE_IGNORE_OVERLAYS.has(dialog) && !keys.includes(dialog)) keys.push(dialog);
+  return keys;
+}
+
 function sharedDialogName(a: RawStep, b: RawStep): boolean {
-  const names = new Set(
-    (a.openOverlays ?? []).map((n) => n.trim().toLowerCase()).filter((n) => n && !MERGE_IGNORE_OVERLAYS.has(n)),
-  );
-  if (names.size === 0) return false;
-  return (b.openOverlays ?? []).some((n) => names.has(n.trim().toLowerCase()));
+  const aDialog = a.dialogName?.trim().toLowerCase();
+  const bDialog = b.dialogName?.trim().toLowerCase();
+  if (
+    aDialog &&
+    bDialog &&
+    !MERGE_IGNORE_OVERLAYS.has(aDialog) &&
+    !MERGE_IGNORE_OVERLAYS.has(bDialog) &&
+    (aDialog === bDialog ||
+      (aDialog.length >= 3 && bDialog.length >= 3 && (aDialog.includes(bDialog) || bDialog.includes(aDialog))))
+  ) {
+    return true;
+  }
+  const names = dialogKeys(a);
+  if (names.length === 0) return false;
+  const set = new Set(names);
+  return dialogKeys(b).some((n) => set.has(n));
 }
 
 function canLinkSteps(current: RawStep, next: RawStep, maxGapMs: number): boolean {
@@ -824,7 +863,8 @@ export function mergeStepGroup(group: RawStep[]): RawStep | null {
     elementRect: last.elementRect,
     viewportSize: last.viewportSize || first.viewportSize,
     scrollPosition: last.scrollPosition || first.scrollPosition,
-    themeCapture: first.themeCapture || last.themeCapture,
+    themeCapture: annotateDark || first.beforeDarkId || last.afterDarkId ? 'dual' : (last.themeCapture || first.themeCapture),
+    dialogName: last.dialogName || first.dialogName,
     subSteps,
   };
 }

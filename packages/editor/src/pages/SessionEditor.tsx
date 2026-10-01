@@ -358,7 +358,8 @@ export default function SessionEditor() {
                     ? {
                         groupIds: [step.id, linkedNext.id],
                         keepSeparateIds: [step.id],
-                        title: 'Merge with the next step — they share a dialog or happened together',
+                        label: 'Merge with below',
+                        title: 'Combine this step with the one below',
                         onMerge: handleMergeGroup,
                         onKeepSeparate: handleKeepSeparate,
                       }
@@ -386,9 +387,17 @@ export default function SessionEditor() {
                       ? {
                           groupIds: [step.id, linkedNext.id, linkedThird.id],
                           keepSeparateIds: [linkedNext.id],
-                          title: 'Also merge the following step into this group',
+                          label: 'Merge with below',
+                          title: 'Combine this step with the one below',
                           onMerge: handleMergeGroup,
                           onKeepSeparate: handleKeepSeparate,
+                        }
+                      : undefined;
+                    const aboveAction: StepMergeAction | undefined = pairAction
+                      ? {
+                          ...pairAction,
+                          label: 'Merge with above',
+                          title: 'Combine this step with the one above',
                         }
                       : undefined;
 
@@ -401,11 +410,11 @@ export default function SessionEditor() {
                         onUpdate={handleStepUpdate}
                         onDelete={handleStepDelete}
                         onScreenshotClick={handleScreenshotClick}
-                        mergeAction={extendAction}
+                        mergeAction={extendAction ?? aboveAction}
                       />
                     );
 
-                    if (linkedThird) {
+                    if (linkedThird && extendAction) {
                       rendered.add(linkedThird.id);
                       elements.push(
                         <StepCard
@@ -415,6 +424,11 @@ export default function SessionEditor() {
                           onUpdate={handleStepUpdate}
                           onDelete={handleStepDelete}
                           onScreenshotClick={handleScreenshotClick}
+                          mergeAction={{
+                            ...extendAction,
+                            label: 'Merge with above',
+                            title: 'Combine this step with the one above',
+                          }}
                         />
                       );
                     }

@@ -441,6 +441,8 @@ function stepInsertValues(s: Step) {
     beforeDarkId: s.beforeDarkId ?? null,
     afterLightId: s.afterLightId ?? null,
     afterDarkId: s.afterDarkId ?? null,
+    annotatedAfterLightId: s.annotatedAfterLightId ?? null,
+    annotatedAfterDarkId: s.annotatedAfterDarkId ?? null,
     sourceEventIds: JSON.stringify(s.sourceEventIds),
     subSteps: JSON.stringify(s.subSteps || []),
     mergeWithNextId: s.mergeWithNextId ?? null,
@@ -498,10 +500,15 @@ sessionsRouter.post('/:id/finalize', async (req, res) => {
       step.afterLightId = step.afterLightId ?? lastEv.afterScreenshotId;
       step.afterDarkId = step.afterDarkId ?? lastEv.afterAltScreenshotId;
 
-      if (!step.themeCapture) {
+      if (step.beforeDarkId || step.afterDarkId || step.altScreenshotId) {
+        step.themeCapture = 'dual';
+      } else if (!step.themeCapture) {
         const themeMeta = sourceEvents
           .map((e) => (e.metadata as { themeCapture?: 'dual' | 'same' }).themeCapture)
-          .find(Boolean);
+          .find((value) => value === 'dual')
+          ?? sourceEvents
+            .map((e) => (e.metadata as { themeCapture?: 'dual' | 'same' }).themeCapture)
+            .find(Boolean);
         if (themeMeta) step.themeCapture = themeMeta;
       }
 
@@ -529,7 +536,9 @@ sessionsRouter.post('/:id/finalize', async (req, res) => {
       const cropAfter = afterKeepsCrop(sourceEvents);
       const canDraw = highlights.length > 0 && !!viewportWidth && !!viewportHeight;
 
-      const [annotatedLight, annotatedDark, cleanLight, cleanDark, croppedAfterLight, croppedAfterDark] = await Promise.all([
+      const afterCropLight = cropAfter ? lightCrop : undefined;
+      const afterCropDark = cropAfter ? darkCrop : undefined;
+      const [annotatedLight, annotatedDark, cleanLight, cleanDark, croppedAfterLight, croppedAfterDark, annotatedAfterLight, annotatedAfterDark] = await Promise.all([
         canDraw && annotateLight
           ? annotateAndSave(req.params.id, annotateLight, highlights, viewportWidth, viewportHeight, ssMap, lightCrop)
           : Promise.resolve(null),
@@ -548,12 +557,20 @@ sessionsRouter.post('/:id/finalize', async (req, res) => {
         cropAfter && rawAfterDark && darkCrop && viewportWidth
           ? annotateAndSave(req.params.id, rawAfterDark, [], viewportWidth, viewportHeight, ssMap, darkCrop)
           : Promise.resolve(null),
+        canDraw && rawAfterLight
+          ? annotateAndSave(req.params.id, rawAfterLight, highlights, viewportWidth, viewportHeight, ssMap, afterCropLight)
+          : Promise.resolve(null),
+        canDraw && rawAfterDark
+          ? annotateAndSave(req.params.id, rawAfterDark, highlights, viewportWidth, viewportHeight, ssMap, afterCropDark)
+          : Promise.resolve(null),
       ]);
 
       if (cleanLight) step.beforeLightId = cleanLight;
       if (cleanDark) step.beforeDarkId = cleanDark;
       if (croppedAfterLight) step.afterLightId = croppedAfterLight;
       if (croppedAfterDark) step.afterDarkId = croppedAfterDark;
+      if (annotatedAfterLight) step.annotatedAfterLightId = annotatedAfterLight;
+      if (annotatedAfterDark) step.annotatedAfterDarkId = annotatedAfterDark;
       if (annotatedLight) step.screenshotId = annotatedLight;
       else if (cleanLight) step.screenshotId = cleanLight;
       if (annotatedDark) step.altScreenshotId = annotatedDark;
@@ -842,10 +859,14 @@ sessionsRouter.post('/:id/merge-steps', async (req, res) => {
     let beforeDarkId = beforeDarkRaw;
     let afterLightId = afterLightRaw;
     let afterDarkId = afterDarkRaw;
+    let annotatedAfterLightId: string | undefined;
+    let annotatedAfterDarkId: string | undefined;
 
     if (viewportWidth && viewportHeight) {
       const canDraw = highlights.length > 0;
-      const [annotatedLight, annotatedDark, cleanLight, cleanDark, croppedAfterLight, croppedAfterDark] = await Promise.all([
+      const afterCropLight = cropAfter ? lightCrop : undefined;
+      const afterCropDark = cropAfter ? darkCrop : undefined;
+      const [annotatedLight, annotatedDark, cleanLight, cleanDark, croppedAfterLight, croppedAfterDark, annotatedAfterLight, annotatedAfterDark] = await Promise.all([
         canDraw && rawLight
           ? annotateAndSave(sessionId, rawLight, highlights, viewportWidth, viewportHeight, ssMap, lightCrop)
           : Promise.resolve(null),
@@ -864,6 +885,12 @@ sessionsRouter.post('/:id/merge-steps', async (req, res) => {
         cropAfter && afterDarkRaw && darkCrop
           ? annotateAndSave(sessionId, afterDarkRaw, [], viewportWidth, viewportHeight, ssMap, darkCrop)
           : Promise.resolve(null),
+        canDraw && afterLightRaw
+          ? annotateAndSave(sessionId, afterLightRaw, highlights, viewportWidth, viewportHeight, ssMap, afterCropLight)
+          : Promise.resolve(null),
+        canDraw && afterDarkRaw
+          ? annotateAndSave(sessionId, afterDarkRaw, highlights, viewportWidth, viewportHeight, ssMap, afterCropDark)
+          : Promise.resolve(null),
       ]);
       if (annotatedLight) newScreenshotId = annotatedLight;
       else if (cleanLight) newScreenshotId = cleanLight;
@@ -873,6 +900,8 @@ sessionsRouter.post('/:id/merge-steps', async (req, res) => {
       if (cleanDark) beforeDarkId = cleanDark;
       if (croppedAfterLight) afterLightId = croppedAfterLight;
       if (croppedAfterDark) afterDarkId = croppedAfterDark;
+      if (annotatedAfterLight) annotatedAfterLightId = annotatedAfterLight;
+      if (annotatedAfterDark) annotatedAfterDarkId = annotatedAfterDark;
     }
 
     // Use the sort order of the first step in the group
@@ -892,6 +921,8 @@ sessionsRouter.post('/:id/merge-steps', async (req, res) => {
       beforeDarkId: beforeDarkId ?? null,
       afterLightId: afterLightId ?? null,
       afterDarkId: afterDarkId ?? null,
+      annotatedAfterLightId: annotatedAfterLightId ?? null,
+      annotatedAfterDarkId: annotatedAfterDarkId ?? null,
       sourceEventIds: JSON.stringify(merged.sourceEventIds),
       subSteps: JSON.stringify(merged.subSteps || []),
       mergeWithNextId: null,
@@ -1043,21 +1074,34 @@ sessionsRouter.patch('/:id/events/:eventId/skip-highlight', async (req, res) => 
           ?? step.altScreenshotId;
         const lightCrop = cropRectFromEvents(sourceEvents, lightSrc);
         const darkCrop = cropRectFromEvents(sourceEvents, darkSrc) ?? lightCrop;
+        const afterLightSrc = [...sourceEvents].reverse().find((e) => e.afterScreenshotId)?.afterScreenshotId;
+        const afterDarkSrc = [...sourceEvents].reverse().find((e) => e.afterAltScreenshotId)?.afterAltScreenshotId;
+        const cropAfter = afterKeepsCrop(sourceEvents);
 
         let newLight = step.screenshotId;
         let newDark = step.altScreenshotId;
+        let annotatedAfterLightId = step.annotatedAfterLightId;
+        let annotatedAfterDarkId = step.annotatedAfterDarkId;
 
         if (highlights.length > 0 && viewportWidth && viewportHeight) {
-          const [annotatedLight, annotatedDark] = await Promise.all([
+          const [annotatedLight, annotatedDark, annotatedAfterLight, annotatedAfterDark] = await Promise.all([
             lightSrc
               ? annotateAndSave(sessionId, lightSrc, highlights, viewportWidth, viewportHeight, ssMap, lightCrop)
               : Promise.resolve(null),
             darkSrc
               ? annotateAndSave(sessionId, darkSrc, highlights, viewportWidth, viewportHeight, ssMap, darkCrop)
               : Promise.resolve(null),
+            afterLightSrc
+              ? annotateAndSave(sessionId, afterLightSrc, highlights, viewportWidth, viewportHeight, ssMap, cropAfter ? lightCrop : undefined)
+              : Promise.resolve(null),
+            afterDarkSrc
+              ? annotateAndSave(sessionId, afterDarkSrc, highlights, viewportWidth, viewportHeight, ssMap, cropAfter ? darkCrop : undefined)
+              : Promise.resolve(null),
           ]);
           if (annotatedLight) newLight = annotatedLight;
           if (annotatedDark) newDark = annotatedDark;
+          if (annotatedAfterLight) annotatedAfterLightId = annotatedAfterLight;
+          if (annotatedAfterDark) annotatedAfterDarkId = annotatedAfterDark;
         }
 
         await db
@@ -1065,6 +1109,8 @@ sessionsRouter.patch('/:id/events/:eventId/skip-highlight', async (req, res) => 
           .set({
             screenshotId: newLight ?? null,
             altScreenshotId: newDark ?? null,
+            annotatedAfterLightId: annotatedAfterLightId ?? null,
+            annotatedAfterDarkId: annotatedAfterDarkId ?? null,
             highlights: specs.length > 0 ? JSON.stringify(specs) : null,
           })
           .where(eq(schema.steps.id, step.id));

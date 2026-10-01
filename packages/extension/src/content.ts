@@ -16,7 +16,7 @@ import {
   extractAfterState,
   getElementStates,
   extractPageFrame,
-  extractDialogCropRect,
+  extractDialogCrop,
 } from './lib/page-extractor.js';
 import {
   enterEditMode,
@@ -64,63 +64,6 @@ let gateSafetyTimer: number | null = null;
 const HIGHLIGHT_PROMPT_TIMEOUT_MS = 4000;
 const BG_PIPELINE_BUDGET_MS = 2000;
 const GATE_SAFETY_TIMEOUT_MS = HIGHLIGHT_PROMPT_TIMEOUT_MS + BG_PIPELINE_BUDGET_MS;
-
-installColorSchemeHook();
-
-function installColorSchemeHook() {
-  try {
-    if (document.documentElement?.getAttribute('data-docext-scheme') === '1') return;
-    const script = document.createElement('script');
-    script.textContent = `(function(){
-      if (window.__docextSetColorScheme) return;
-      var native = window.matchMedia.bind(window);
-      var scheme = null;
-      var listeners = new Set();
-      function schemeMatches(query) {
-        var q = String(query);
-        var darkQ = q.indexOf('prefers-color-scheme') !== -1 && q.indexOf('dark') !== -1;
-        var lightQ = q.indexOf('prefers-color-scheme') !== -1 && q.indexOf('light') !== -1;
-        if (!darkQ && !lightQ) return null;
-        if (scheme === 'dark') return darkQ;
-        if (scheme === 'light') return lightQ;
-        return null;
-      }
-      window.matchMedia = function(query) {
-        var list = native(query);
-        var wrapped = {
-          media: String(query),
-          onchange: null,
-          addListener: function(fn) { listeners.add(fn); list.addListener(fn); },
-          removeListener: function(fn) { listeners.delete(fn); list.removeListener(fn); },
-          addEventListener: function(type, fn) { if (type === 'change') listeners.add(fn); list.addEventListener(type, fn); },
-          removeEventListener: function(type, fn) { listeners.delete(fn); list.removeEventListener(type, fn); },
-          dispatchEvent: function(ev) { return list.dispatchEvent(ev); }
-        };
-        Object.defineProperty(wrapped, 'matches', { get: function() {
-          var next = schemeMatches(query);
-          return next === null ? list.matches : next;
-        }});
-        return wrapped;
-      };
-      window.__docextSetColorScheme = function(next) {
-        scheme = next === 'dark' || next === 'light' ? next : null;
-        listeners.forEach(function(fn) {
-          try { fn({ matches: scheme === 'dark', media: '(prefers-color-scheme: ' + (scheme || 'light') + ')' }); } catch (e) {}
-        });
-      };
-      window.addEventListener('message', function(ev) {
-        if (ev.source !== window || !ev.data || ev.data.__docextColorScheme === undefined) return;
-        var t = ev.data.__docextColorScheme;
-        window.__docextSetColorScheme(t === 'dark' || t === 'light' ? t : null);
-      });
-    })();`;
-    const parent = document.documentElement || document.head;
-    if (!parent) return;
-    parent.appendChild(script);
-    script.remove();
-    document.documentElement.setAttribute('data-docext-scheme', '1');
-  } catch { /* document not ready */ }
-}
 
 // Guard against duplicate script injection
 const INJECTED_KEY = '__docext_injected';
@@ -377,19 +320,21 @@ function shouldCaptureAfter(
   target: Element,
   beforeStates: ReturnType<typeof getElementStates>,
   beforeUrl: string,
-  beforeOverlayCount: number,
+  beforeOverlays: string[],
 ): { capture: boolean; outcome: ReturnType<typeof extractAfterState> } {
-  const outcome = extractAfterState(document.contains(target) ? target : null, beforeStates, beforeUrl);
+  const outcome = extractAfterState(document.contains(target) ? target : null, beforeStates, beforeUrl, beforeOverlays);
   if (outcome.outcome !== 'unknown') return { capture: true, outcome };
   try {
     const frame = extractPageFrame();
-    if (frame.openOverlays.length > beforeOverlayCount) {
+    const beforeSet = new Set(beforeOverlays.map((n) => n.trim().toLowerCase()).filter(Boolean));
+    const newly = frame.openOverlays.filter((n) => n.trim() && !beforeSet.has(n.trim().toLowerCase()));
+    if (newly.length > 0) {
       return {
         capture: true,
         outcome: {
           ...outcome,
           outcome: 'opened-dialog',
-          openOverlayName: frame.openOverlays[0],
+          openOverlayName: newly[0],
         },
       };
     }
@@ -414,12 +359,12 @@ function afterReplayFlow(
   eventId: string,
   beforeStates: ReturnType<typeof getElementStates>,
   beforeUrl: string,
-  beforeOverlayCount: number,
+  beforeOverlays: string[],
   ephemeral: boolean,
 ) {
-  const settleMs = ephemeral ? 250 : 120;
+  const settleMs = ephemeral ? 450 : 320;
   window.setTimeout(() => {
-    const { capture, outcome } = shouldCaptureAfter(target, beforeStates, beforeUrl, beforeOverlayCount);
+    const { outcome } = shouldCaptureAfter(target, beforeStates, beforeUrl, beforeOverlays);
     const revealPrompt = () => {
       showToolbar();
       if (!isTopFrame) return;
@@ -427,26 +372,14 @@ function afterReplayFlow(
         label,
         () => {},
         () => safeSendMessage({ type: 'SET_SKIP_HIGHLIGHT', payload: { eventId } }),
-        () => {
-          if (capture) return;
-          hideToolbar();
-          void safeSendMessage({
-            type: 'CAPTURE_AFTER',
-            payload: { eventId, afterOutcome: outcome },
-          }).finally(() => showToolbar());
-        },
+        () => {},
       );
     };
-    if (capture) {
-      // Keep the toolbar out of the after shot, then show the prompt.
-      hideToolbar();
-      void safeSendMessage({
-        type: 'CAPTURE_AFTER',
-        payload: { eventId, afterOutcome: outcome },
-      }).finally(revealPrompt);
-      return;
-    }
-    revealPrompt();
+    hideToolbar();
+    void safeSendMessage({
+      type: 'CAPTURE_AFTER',
+      payload: { eventId, afterOutcome: outcome },
+    }).finally(revealPrompt);
   }, settleMs);
 }
 
@@ -556,8 +489,8 @@ function handlePointerdown(e: PointerEvent) {
     info.selector;
   const beforeStates = getElementStates(target);
   const beforeUrl = location.href;
-  let beforeOverlayCount = 0;
-  try { beforeOverlayCount = extractPageFrame().openOverlays.length; } catch { /* ignore */ }
+  let beforeOverlays: string[] = [];
+  try { beforeOverlays = extractPageFrame().openOverlays; } catch { /* ignore */ }
 
   const dispatchAndReplay = (ev: typeof capturedEvent) => {
     lastClickSentAt = Date.now();
@@ -586,7 +519,7 @@ function handlePointerdown(e: PointerEvent) {
           lastClickSentAt = Date.now();
           setLastClickTimestamp(lastClickSentAt);
           replayFullChain(target, e, sel, fallback);
-          afterReplayFlow(target, label, eventId, beforeStates, beforeUrl, beforeOverlayCount, ephemeral);
+          afterReplayFlow(target, label, eventId, beforeStates, beforeUrl, beforeOverlays, ephemeral);
         }, ephemeral ? 90 : 24);
       })
       .catch(() => {
@@ -594,7 +527,7 @@ function handlePointerdown(e: PointerEvent) {
           lastClickSentAt = Date.now();
           setLastClickTimestamp(lastClickSentAt);
           replayFullChain(target, e, sel, fallback);
-          afterReplayFlow(target, label, eventId, beforeStates, beforeUrl, beforeOverlayCount, ephemeral);
+          afterReplayFlow(target, label, eventId, beforeStates, beforeUrl, beforeOverlays, ephemeral);
         }, ephemeral ? 90 : 24);
       });
   };
@@ -662,8 +595,8 @@ function handleClick(e: MouseEvent) {
     info.selector;
   const beforeStates = getElementStates(target);
   const beforeUrl = location.href;
-  let beforeOverlayCount = 0;
-  try { beforeOverlayCount = extractPageFrame().openOverlays.length; } catch { /* ignore */ }
+  let beforeOverlays: string[] = [];
+  try { beforeOverlays = extractPageFrame().openOverlays; } catch { /* ignore */ }
 
   e.preventDefault();
   e.stopImmediatePropagation();
@@ -682,7 +615,7 @@ function handleClick(e: MouseEvent) {
         lastClickSentAt = Date.now();
         setLastClickTimestamp(lastClickSentAt);
         replayClick(replayTarget, sel, fallback);
-        afterReplayFlow(replayTarget, label, eventId, beforeStates, beforeUrl, beforeOverlayCount, ephemeralFallback);
+        afterReplayFlow(replayTarget, label, eventId, beforeStates, beforeUrl, beforeOverlays, ephemeralFallback);
       }, ephemeralFallback ? 90 : 24);
     })
     .catch(() => {
@@ -690,7 +623,7 @@ function handleClick(e: MouseEvent) {
         lastClickSentAt = Date.now();
         setLastClickTimestamp(lastClickSentAt);
         replayClick(replayTarget, sel, fallback);
-        afterReplayFlow(replayTarget, label, eventId, beforeStates, beforeUrl, beforeOverlayCount, ephemeralFallback);
+        afterReplayFlow(replayTarget, label, eventId, beforeStates, beforeUrl, beforeOverlays, ephemeralFallback);
       }, ephemeralFallback ? 90 : 24);
     });
 }
@@ -773,8 +706,8 @@ function handleKeydown(e: KeyboardEvent) {
     info.selector;
   const beforeStates = getElementStates(target);
   const beforeUrl = location.href;
-  let beforeOverlayCount = 0;
-  try { beforeOverlayCount = extractPageFrame().openOverlays.length; } catch { /* ignore */ }
+  let beforeOverlays: string[] = [];
+  try { beforeOverlays = extractPageFrame().openOverlays; } catch { /* ignore */ }
 
   lastClickSentAt = Date.now();
   setLastClickTimestamp(lastClickSentAt);
@@ -788,7 +721,7 @@ function handleKeydown(e: KeyboardEvent) {
         } finally {
           isReplayingClick = false;
         }
-        afterReplayFlow(target, label, capturedEvent.id, beforeStates, beforeUrl, beforeOverlayCount, ephemeral);
+        afterReplayFlow(target, label, capturedEvent.id, beforeStates, beforeUrl, beforeOverlays, ephemeral);
       }, ephemeral ? 90 : 24);
     })
     .catch(() => {
@@ -958,9 +891,27 @@ function messageHandler(message: ExtensionMessage, _sender: chrome.runtime.Messa
     case 'GET_STATE':
       sendResponse({ isRecording, editMode: isEditMode() });
       break;
-    case 'GET_DIALOG_CROP':
-      sendResponse({ cropRect: extractDialogCropRect() ?? null });
+    case 'GET_DIALOG_CROP': {
+      const selector = (message.payload as { selector?: string } | undefined)?.selector;
+      let fromEl: Element | null = null;
+      if (selector) {
+        try { fromEl = document.querySelector(selector); } catch { /* invalid selector */ }
+      }
+      const dialog = extractDialogCrop(fromEl);
+      let elementRect: { x: number; y: number; width: number; height: number } | undefined;
+      if (fromEl) {
+        const rect = fromEl.getBoundingClientRect();
+        if (rect.width >= 2 && rect.height >= 2) {
+          elementRect = { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
+        }
+      }
+      sendResponse({
+        cropRect: dialog?.cropRect ?? null,
+        dialogName: dialog?.dialogName,
+        elementRect: elementRect ?? null,
+      });
       break;
+    }
   }
   return true;
 }

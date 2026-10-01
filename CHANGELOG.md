@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.2.1
+
+### Changed
+- Every before and after capture keeps both a light frame and a dark frame. Similar-looking frames are no longer dropped.
+- The step card opens with both themes of the before shot, then both themes of the after shot. Highlights, Moment, and Theme are separate controls. Annotated is hidden when a step has no highlight.
+- Merge suggestions say **Merge with below** or **Merge with above**, with **Keep separate** on the same bar.
+- Screenshots crop to an open dropdown, or to the whole modal behind a confirm. The app sidebar and the bare page stay full-frame.
+- Theme emulation is a main-world file (`color-scheme-hook.js`) so it can run on pages that block inline scripts.
+
 ## v0.2.0
 
 ### Added

@@ -220,6 +220,34 @@ function buildNumberedHighlightSvg(
   return parts.join('\n');
 }
 
+/** Grow a dialog crop so every highlight stays inside the frame. */
+function expandCropToHighlights(
+  crop: Rect,
+  highlights: Highlight[],
+  viewportWidth: number,
+  viewportHeight: number,
+): Rect {
+  let x0 = crop.x;
+  let y0 = crop.y;
+  let x1 = crop.x + crop.width;
+  let y1 = crop.y + crop.height;
+  for (const h of highlights) {
+    const r = h.rect;
+    if (r.width < 2 || r.height < 2) continue;
+    x0 = Math.min(x0, r.x);
+    y0 = Math.min(y0, r.y);
+    x1 = Math.max(x1, r.x + r.width);
+    y1 = Math.max(y1, r.y + r.height);
+  }
+  const pad = 28;
+  x0 = Math.max(0, x0 - pad);
+  y0 = Math.max(0, y0 - pad);
+  x1 = Math.min(viewportWidth || x1, x1 + pad);
+  y1 = Math.min(viewportHeight || y1, y1 + pad);
+  if (x1 - x0 < 40 || y1 - y0 < 40) return crop;
+  return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+}
+
 /** Pixel crop of a dialog content box, or null when the box is missing or nearly full-viewport. */
 export function planCrop(
   cropRect: Rect,
@@ -261,7 +289,13 @@ export async function annotateScreenshot(
   const scaleY = viewportHeight > 0 ? imgH / viewportHeight : 1;
 
   const crop = options.cropRect
-    ? planCrop(options.cropRect, viewportWidth, viewportHeight, imgW, imgH)
+    ? planCrop(
+        expandCropToHighlights(options.cropRect, highlights, viewportWidth, viewportHeight),
+        viewportWidth,
+        viewportHeight,
+        imgW,
+        imgH,
+      )
     : null;
 
   let base = rawImageBuffer;

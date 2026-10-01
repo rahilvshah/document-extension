@@ -9,6 +9,8 @@ export interface StepMergeAction {
   groupIds: string[];
   /** Step ids whose merge link is cleared by Keep separate. */
   keepSeparateIds: string[];
+  /** Visible label, including which neighbor is combined. */
+  label: string;
   title: string;
   onMerge: (groupIds: string[]) => Promise<void>;
   onKeepSeparate: (groupIds: string[]) => Promise<void>;
@@ -23,8 +25,14 @@ interface StepCardProps {
   mergeAction?: StepMergeAction;
 }
 
-type FrameTab = 'annotated' | 'clean' | 'after';
+type FrameTab = 'annotated' | 'clean';
+type MomentTab = 'before' | 'after' | 'both';
 type ThemeTab = 'light' | 'dark' | 'both';
+
+interface ShotPair {
+  light?: string;
+  dark?: string;
+}
 
 export default memo(function StepCard({
   step,
@@ -36,11 +44,20 @@ export default memo(function StepCard({
 }: StepCardProps) {
   const [editingField, setEditingField] = useState<'title' | 'description' | null>(null);
   const [draft, setDraft] = useState('');
-  const [frame, setFrame] = useState<FrameTab>('annotated');
-  const [mergeBusy, setMergeBusy] = useState<'merge' | 'keep' | null>(null);
-  const [theme, setTheme] = useState<ThemeTab>(
-    step.themeCapture === 'same' || !step.altScreenshotId ? 'light' : 'both',
+  const hasAnnotation = !!(step.highlights?.some(
+    (h) => !h.skip && h.rect.width >= 2 && h.rect.height >= 2,
+  ));
+  const [frame, setFrame] = useState<FrameTab>(hasAnnotation ? 'annotated' : 'clean');
+  const [moment, setMoment] = useState<MomentTab>(
+    step.afterLightId || step.afterDarkId || step.annotatedAfterLightId || step.annotatedAfterDarkId
+      ? 'both'
+      : 'before',
   );
+  const [mergeBusy, setMergeBusy] = useState<'merge' | 'keep' | null>(null);
+  const hasDark = !!(
+    step.altScreenshotId || step.beforeDarkId || step.afterDarkId || step.annotatedAfterDarkId
+  );
+  const [theme, setTheme] = useState<ThemeTab>(hasDark ? 'both' : 'light');
 
   const {
     attributes,
@@ -57,28 +74,37 @@ export default memo(function StepCard({
     opacity: isDragging ? 0.5 : 1,
   };
 
+  const activeFrame: FrameTab = hasAnnotation ? frame : 'clean';
   const hasClean = !!(step.beforeLightId || step.beforeDarkId);
-  const hasResult = !!(step.afterLightId || step.afterDarkId);
-  const showDark = step.themeCapture !== 'same';
+  const hasResult = !!(
+    step.afterLightId || step.afterDarkId || step.annotatedAfterLightId || step.annotatedAfterDarkId
+  );
+  const showDark = hasDark;
 
-  const pair = useMemo(() => {
-    if (frame === 'clean') {
-      return {
-        light: step.beforeLightId || step.screenshotId,
-        dark: showDark ? (step.beforeDarkId || step.altScreenshotId) : undefined,
-      };
-    }
-    if (frame === 'after') {
-      return {
-        light: step.afterLightId,
-        dark: showDark ? step.afterDarkId : undefined,
-      };
-    }
-    return {
+  const shots = useMemo(() => {
+    const annotatedBefore: ShotPair = {
       light: step.screenshotId,
       dark: showDark ? step.altScreenshotId : undefined,
     };
-  }, [frame, step, showDark]);
+    const annotatedAfter: ShotPair = {
+      light: step.annotatedAfterLightId || step.afterLightId,
+      dark: showDark ? (step.annotatedAfterDarkId || step.afterDarkId) : undefined,
+    };
+    const cleanBefore: ShotPair = {
+      light: step.beforeLightId || step.screenshotId,
+      dark: showDark ? (step.beforeDarkId || step.altScreenshotId) : undefined,
+    };
+    const cleanAfter: ShotPair = {
+      light: step.afterLightId,
+      dark: showDark ? step.afterDarkId : undefined,
+    };
+    return activeFrame === 'clean'
+      ? { before: cleanBefore, after: cleanAfter }
+      : { before: annotatedBefore, after: annotatedAfter };
+  }, [activeFrame, step, showDark]);
+
+  const visibleMoments: Array<'before' | 'after'> =
+    moment === 'both' && hasResult ? ['before', 'after'] : moment === 'after' && hasResult ? ['after'] : ['before'];
 
   const startEditing = (field: 'title' | 'description') => {
     setDraft(field === 'title' ? step.title : step.description);
@@ -92,30 +118,32 @@ export default memo(function StepCard({
     setEditingField(null);
   };
 
-  const tabBtn = (active: boolean) =>
-    `px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide border transition-colors ${
-      active
-        ? 'bg-indigo-500 text-white border-indigo-500'
-        : 'bg-white/80 text-slate-600 border-slate-200 hover:border-indigo-300'
+  const segmentBtn = (active: boolean) =>
+    `px-2.5 py-1 text-[11px] font-medium border-0 cursor-pointer transition-colors ${
+      active ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
     }`;
 
-  const renderShot = (id: string | undefined, label: string) => {
+  const renderShot = (id: string | undefined, caption: string | undefined) => {
     if (!id) return null;
     return (
-      <div className="cursor-pointer relative" onClick={() => onScreenshotClick(id)}>
-        {pair.dark && theme === 'both' && (
-          <span className="absolute top-2 left-2 bg-white/80 text-[10px] text-slate-700 px-1.5 py-0.5 rounded font-medium tracking-wide uppercase border border-slate-200 z-10">
-            {label}
-          </span>
+      <button
+        type="button"
+        className="block w-full text-left bg-slate-100 cursor-pointer border-0 p-0"
+        onClick={() => onScreenshotClick(id)}
+      >
+        {caption && (
+          <div className="px-3 pt-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+            {caption}
+          </div>
         )}
         <img
           src={getScreenshotUrl(id)}
-          alt={`Step ${index + 1} ${label}`}
-          className="w-full max-h-[400px] object-contain"
+          alt={`Step ${index + 1} ${caption || 'screenshot'}`}
+          className="w-full max-h-[420px] object-contain bg-slate-100"
           loading="lazy"
           onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
         />
-      </div>
+      </button>
     );
   };
 
@@ -175,84 +203,116 @@ export default memo(function StepCard({
         </button>
       </div>
 
-      {/* Frame / theme tabs */}
-      {(pair.light || hasClean || hasResult || mergeAction) && (
-        <div className="flex flex-wrap items-center gap-2 px-4 py-2 border-b border-slate-200/60 bg-slate-50/80">
-          <div className="flex gap-1">
-            <button type="button" className={tabBtn(frame === 'annotated')} onClick={() => setFrame('annotated')}>
-              Annotated
+      {mergeAction && (
+        <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 border-b border-amber-200/80 bg-amber-50">
+          <p className="text-xs text-amber-950">{mergeAction.title}</p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={!!mergeBusy}
+              title={mergeAction.title}
+              onClick={() => {
+                setMergeBusy('merge');
+                void mergeAction.onMerge(mergeAction.groupIds).finally(() => setMergeBusy(null));
+              }}
+              className="px-2.5 py-1 rounded-md bg-amber-700 text-white text-xs font-medium border-0 cursor-pointer disabled:opacity-60"
+            >
+              {mergeBusy === 'merge' ? 'Merging…' : mergeAction.label}
             </button>
             <button
               type="button"
-              className={tabBtn(frame === 'clean')}
-              onClick={() => setFrame('clean')}
-              disabled={!hasClean && !step.screenshotId}
+              disabled={!!mergeBusy}
+              title="Keep these steps separate"
+              onClick={() => {
+                setMergeBusy('keep');
+                void mergeAction.onKeepSeparate(mergeAction.keepSeparateIds).finally(() => setMergeBusy(null));
+              }}
+              className="px-2.5 py-1 rounded-md bg-white text-amber-950 text-xs font-medium border border-amber-300 cursor-pointer disabled:opacity-60"
             >
-              Clean
+              {mergeBusy === 'keep' ? 'Saving…' : 'Keep separate'}
             </button>
-            <button
-              type="button"
-              className={tabBtn(frame === 'after')}
-              onClick={() => setFrame('after')}
-              disabled={!hasResult}
-              title={hasResult ? 'Screenshot of the page after this click' : 'No after-click capture'}
-            >
-              After
-            </button>
-            {mergeAction && (
-              <>
-                <button
-                  type="button"
-                  className={tabBtn(false)}
-                  disabled={!!mergeBusy}
-                  title={mergeAction.title}
-                  onClick={() => {
-                    setMergeBusy('merge');
-                    void mergeAction.onMerge(mergeAction.groupIds).finally(() => setMergeBusy(null));
-                  }}
-                >
-                  {mergeBusy === 'merge' ? 'Merging…' : 'Merge'}
-                </button>
-                <button
-                  type="button"
-                  className={tabBtn(false)}
-                  disabled={!!mergeBusy}
-                  title="Keep these steps separate"
-                  onClick={() => {
-                    setMergeBusy('keep');
-                    void mergeAction.onKeepSeparate(mergeAction.keepSeparateIds).finally(() => setMergeBusy(null));
-                  }}
-                >
-                  {mergeBusy === 'keep' ? 'Saving…' : 'Separate'}
-                </button>
-              </>
-            )}
           </div>
-          {showDark && (pair.dark || step.altScreenshotId) && (
-            <div className="flex gap-1 ml-auto">
-              <button type="button" className={tabBtn(theme === 'light')} onClick={() => setTheme('light')}>
-                Light
-              </button>
-              <button type="button" className={tabBtn(theme === 'dark')} onClick={() => setTheme('dark')}>
-                Dark
-              </button>
-              <button type="button" className={tabBtn(theme === 'both')} onClick={() => setTheme('both')}>
-                Both
-              </button>
+        </div>
+      )}
+
+      {(hasAnnotation || hasResult || (showDark && (shots.before.dark || shots.after.dark || step.altScreenshotId))) && (
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 px-4 py-2.5 border-b border-slate-200/60 bg-slate-50/80">
+          {hasAnnotation && (
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Highlights</span>
+              <div className="flex overflow-hidden rounded-md border border-slate-200">
+                <button type="button" className={segmentBtn(frame === 'annotated')} onClick={() => setFrame('annotated')}>
+                  Annotated
+                </button>
+                <button
+                  type="button"
+                  className={`${segmentBtn(activeFrame === 'clean')} border-l border-slate-200`}
+                  onClick={() => setFrame('clean')}
+                  disabled={!hasClean && !step.screenshotId}
+                >
+                  Clean
+                </button>
+              </div>
+            </div>
+          )}
+          {hasResult && (
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Moment</span>
+              <div className="flex overflow-hidden rounded-md border border-slate-200">
+                {(['before', 'after', 'both'] as const).map((value, i) => (
+                  <button
+                    key={value}
+                    type="button"
+                    className={`${segmentBtn(moment === value)} ${i > 0 ? 'border-l border-slate-200' : ''}`}
+                    onClick={() => setMoment(value)}
+                  >
+                    {value === 'before' ? 'Before' : value === 'after' ? 'After' : 'Both'}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {showDark && (shots.before.dark || shots.after.dark || step.altScreenshotId) && (
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Theme</span>
+              <div className="flex overflow-hidden rounded-md border border-slate-200">
+                {(['light', 'dark', 'both'] as const).map((value, i) => (
+                  <button
+                    key={value}
+                    type="button"
+                    className={`${segmentBtn(theme === value)} ${i > 0 ? 'border-l border-slate-200' : ''}`}
+                    onClick={() => setTheme(value)}
+                  >
+                    {value === 'light' ? 'Light' : value === 'dark' ? 'Dark' : 'Both'}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
         </div>
       )}
 
-      {pair.light && (
-        <div
-          className={`bg-slate-100 ${
-            theme === 'both' && pair.dark ? 'grid grid-cols-2 gap-px' : ''
-          }`}
-        >
-          {(theme === 'light' || theme === 'both') && renderShot(pair.light, 'Light')}
-          {(theme === 'dark' || theme === 'both') && pair.dark && renderShot(pair.dark, 'Dark')}
-          {theme === 'dark' && !pair.dark && renderShot(pair.light, 'Light')}
+      {visibleMoments.some((m) => shots[m].light || shots[m].dark) && (
+        <div className="flex flex-col">
+          {visibleMoments.map((which) => {
+            const pair = shots[which];
+            const themeBoth = theme === 'both' && !!pair.dark;
+            const showLight = theme === 'light' || theme === 'both' || !pair.dark;
+            const showDarkShot = (theme === 'dark' || theme === 'both') && !!pair.dark;
+            return (
+              <section key={which} className="border-b border-slate-200/70 last:border-b-0">
+                {visibleMoments.length > 1 && (
+                  <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-500 bg-white">
+                    {which === 'before' ? 'Before' : 'After'}
+                  </div>
+                )}
+                <div className={themeBoth ? 'grid grid-cols-2 gap-px bg-slate-200' : ''}>
+                  {showLight && renderShot(pair.light, themeBoth ? 'Light' : undefined)}
+                  {showDarkShot && renderShot(pair.dark, themeBoth ? 'Dark' : undefined)}
+                </div>
+              </section>
+            );
+          })}
         </div>
       )}
 

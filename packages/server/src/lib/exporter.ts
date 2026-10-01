@@ -43,7 +43,7 @@ async function exportHtml(data: ExportData, inline = true): Promise<string> {
   const stepsHtml: string[] = [];
 
   const allIds = data.steps.flatMap((s) =>
-    [s.screenshotId, s.altScreenshotId, s.afterLightId, s.afterDarkId].filter((id): id is string => !!id),
+    [s.screenshotId, s.altScreenshotId, s.annotatedAfterLightId, s.annotatedAfterDarkId, s.afterLightId, s.afterDarkId].filter((id): id is string => !!id),
   );
   const ssMap = inline ? await loadScreenshotMap(allIds) : undefined;
 
@@ -62,15 +62,16 @@ async function exportHtml(data: ExportData, inline = true): Promise<string> {
       }
     }
 
+    const resultLightId = step.annotatedAfterLightId || step.afterLightId;
     let afterImgTag = '';
-    if (step.afterLightId) {
+    if (resultLightId) {
       if (inline) {
-        const b64 = await loadScreenshotBase64(step.afterLightId, ssMap);
+        const b64 = await loadScreenshotBase64(resultLightId, ssMap);
         if (b64) {
           afterImgTag = `<h3 style="font-size:1em;margin:16px 0 8px;">Result</h3><img src="${b64}" alt="Step ${i + 1} result" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px;margin:12px 0;" />`;
         }
       } else {
-        afterImgTag = `<h3 style="font-size:1em;margin:16px 0 8px;">Result</h3><img src="screenshots/${step.afterLightId}.webp" alt="Step ${i + 1} result" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px;margin:12px 0;" />`;
+        afterImgTag = `<h3 style="font-size:1em;margin:16px 0 8px;">Result</h3><img src="screenshots/${resultLightId}.webp" alt="Step ${i + 1} result" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px;margin:12px 0;" />`;
       }
     }
 
@@ -158,8 +159,10 @@ export async function exportZip(
     if (step.beforeDarkId && step.beforeDarkId !== step.altScreenshotId) {
       names.cleanDark = `step${stepLabel}-clean-dark.webp`;
     }
-    if (step.afterLightId) names.afterLight = `step${stepLabel}-after-light.webp`;
-    if (step.afterDarkId) names.afterDark = `step${stepLabel}-after-dark.webp`;
+    const resultLightId = step.annotatedAfterLightId || step.afterLightId;
+    const resultDarkId = step.annotatedAfterDarkId || step.afterDarkId;
+    if (resultLightId) names.afterLight = `step${stepLabel}-after-light.webp`;
+    if (resultDarkId) names.afterDark = `step${stepLabel}-after-dark.webp`;
     imageNamesByStep.set(i, names);
   }
 
@@ -175,8 +178,10 @@ export async function exportZip(
     if (step.altScreenshotId && names.alt) idToZipName.set(step.altScreenshotId, names.alt);
     if (step.beforeLightId && names.cleanLight) idToZipName.set(step.beforeLightId, names.cleanLight);
     if (step.beforeDarkId && names.cleanDark) idToZipName.set(step.beforeDarkId, names.cleanDark);
-    if (step.afterLightId && names.afterLight) idToZipName.set(step.afterLightId, names.afterLight);
-    if (step.afterDarkId && names.afterDark) idToZipName.set(step.afterDarkId, names.afterDark);
+    const resultLightId = step.annotatedAfterLightId || step.afterLightId;
+    const resultDarkId = step.annotatedAfterDarkId || step.afterDarkId;
+    if (resultLightId && names.afterLight) idToZipName.set(resultLightId, names.afterLight);
+    if (resultDarkId && names.afterDark) idToZipName.set(resultDarkId, names.afterDark);
   }
 
   const screenshotIds = [...idToZipName.keys()];

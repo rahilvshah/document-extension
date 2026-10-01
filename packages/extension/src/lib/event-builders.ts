@@ -15,6 +15,7 @@ import {
   extractPageFrame,
   extractControl,
   extractDialogCropRect,
+  extractDialogCrop,
   computeAccessibleName,
   getElementStates,
   type ExtractOptions,
@@ -96,31 +97,17 @@ function pickBestHighlightTarget(hit: Element): Element {
 }
 
 function highlightRectFor(el: Element, clientX: number, clientY: number): DOMRect {
-  const candidates: Element[] = [el];
-  try {
-    const hit = document.elementFromPoint(clientX, clientY);
-    if (hit) candidates.push(hit);
-  } catch { /* ignore */ }
-
-  let best = el.getBoundingClientRect();
-  let bestScore = -1;
-  const score = (r: DOMRect) => {
-    if (r.width < 8 || r.height < 8) return -1;
-    if (r.width > window.innerWidth * 0.85 || r.height > window.innerHeight * 0.4) return -1;
-    if (r.height < 22) return r.width;
-    return r.width * r.height;
-  };
-
-  for (const candidate of candidates) {
-    const target = pickBestHighlightTarget(candidate);
-    const rect = target.getBoundingClientRect();
-    const next = score(rect);
-    if (next > bestScore) {
-      best = rect;
-      bestScore = next;
-    }
+  // Stay on the control that was clicked. A larger row under the pointer
+  // (the next list item, a stretched parent) pulls the box off the label.
+  const target = pickBestHighlightTarget(el);
+  const rect = target.getBoundingClientRect();
+  const containsClick = clientX >= rect.left - 4 && clientX <= rect.right + 4
+    && clientY >= rect.top - 4 && clientY <= rect.bottom + 4;
+  if (rect.width >= 8 && rect.height >= 8 && rect.width <= window.innerWidth * 0.85 && containsClick) {
+    return rect;
   }
-  return bestScore < 0 ? el.getBoundingClientRect() : best;
+  const own = el.getBoundingClientRect();
+  return own.width >= 2 && own.height >= 2 ? own : rect;
 }
 
 export function generateId(): string {
@@ -183,10 +170,17 @@ export function buildClickEvent(
   opts?: { inEphemeralUI?: boolean; hotPath?: boolean },
 ): RecordedEvent {
   const highlightRect = highlightRectFor(el, e.clientX, e.clientY);
-  const cropRect = extractDialogCropRect(el);
+  const dialog = extractDialogCrop(el);
 
   const layers = enrichFromLayers(el, { hotPath: opts?.hotPath });
   const accessibleName = layers.accessibleName || info.ariaLabel || info.text || undefined;
+  let openOverlays = layers.openOverlays;
+  if (!openOverlays) {
+    try {
+      const names = extractPageFrame().openOverlays;
+      openOverlays = names.length ? names : undefined;
+    } catch { /* detached */ }
+  }
 
   const meta: ClickMeta = {
     elementTag: info.tag,
@@ -221,9 +215,10 @@ export function buildClickEvent(
     accessibleDescription: layers.accessibleDescription,
     states: layers.states,
     pageHeading: layers.pageHeading,
-    openOverlays: layers.openOverlays,
+    openOverlays,
     buttonType: layers.buttonType,
-    cropRect,
+    cropRect: dialog?.cropRect,
+    dialogName: dialog?.dialogName,
   };
   return {
     id: generateId(),

@@ -19,6 +19,8 @@ export function toStep(r: typeof schema.steps.$inferSelect): Step {
     beforeDarkId: r.beforeDarkId ?? undefined,
     afterLightId: r.afterLightId ?? undefined,
     afterDarkId: r.afterDarkId ?? undefined,
+    annotatedAfterLightId: r.annotatedAfterLightId ?? undefined,
+    annotatedAfterDarkId: r.annotatedAfterDarkId ?? undefined,
     sourceEventIds: JSON.parse(r.sourceEventIds) as string[],
     isEdited: !!r.isEdited,
     subSteps: subSteps.length > 0 ? subSteps : undefined,

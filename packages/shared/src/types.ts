@@ -98,6 +98,8 @@ export interface ClickMeta {
   buttonType?: string;
   /** Dialog content box when this click happened inside an open modal. */
   cropRect?: Rect;
+  /** Accessible name of the outer dialog that contained this click. */
+  dialogName?: string;
 }
 
 export interface InputMeta {
@@ -279,6 +281,10 @@ export interface Step {
   afterLightId?: string;
   /** Raw after dark */
   afterDarkId?: string;
+  /** Annotated after light */
+  annotatedAfterLightId?: string;
+  /** Annotated after dark */
+  annotatedAfterDarkId?: string;
   sourceEventIds: string[];
   isEdited: boolean;
   subSteps?: SubStep[];

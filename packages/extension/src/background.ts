@@ -274,30 +274,6 @@ async function toWebp(blob: Blob): Promise<Blob> {
   return out;
 }
 
-/** Downscaled pixel compare so near-identical light/dark frames are dropped. */
-async function framesLookSame(a: Blob, b: Blob): Promise<boolean> {
-  const [ia, ib] = await Promise.all([createImageBitmap(a), createImageBitmap(b)]);
-  try {
-    const size = 16;
-    const canvas = new OffscreenCanvas(size, size);
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return false;
-    ctx.drawImage(ia, 0, 0, size, size);
-    const pa = ctx.getImageData(0, 0, size, size).data;
-    ctx.drawImage(ib, 0, 0, size, size);
-    const pb = ctx.getImageData(0, 0, size, size).data;
-    let diff = 0;
-    const pixels = size * size;
-    for (let i = 0; i < pa.length; i += 4) {
-      diff += Math.abs(pa[i] - pb[i]) + Math.abs(pa[i + 1] - pb[i + 1]) + Math.abs(pa[i + 2] - pb[i + 2]);
-    }
-    return diff / (pixels * 3) < 12;
-  } finally {
-    ia.close();
-    ib.close();
-  }
-}
-
 // ── Page Observer Pausing ──
 
 async function pausePageObservers() {
@@ -409,11 +385,18 @@ function pageThemeChanged(lightSig: string, darkSig: string): boolean {
     const bg = (part || '').split('|')[0] || '';
     return bg !== '' && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)';
   };
-  const [htmlL, bodyL, mainL] = lightSig.split('||');
-  const [htmlD, bodyD, mainD] = darkSig.split('||');
-  if (opaqueBg(bodyL) && bodyL !== bodyD) return true;
-  if (opaqueBg(mainL) && mainL !== mainD) return true;
-  if (!opaqueBg(bodyL) && !opaqueBg(mainL) && opaqueBg(htmlL) && htmlL !== htmlD) return true;
+  const light = lightSig.split('||');
+  const dark = darkSig.split('||');
+  const len = Math.max(light.length, dark.length);
+  // 0 html, 1 body, 2 main, 3 open dialog, 4 app root.
+  // A dialog or app-root change counts even when the page shell stays put.
+  for (let i = 1; i < len; i++) {
+    if (opaqueBg(light[i]) && light[i] !== dark[i]) return true;
+    if (opaqueBg(dark[i]) && dark[i] !== light[i]) return true;
+  }
+  const bodyOpaque = opaqueBg(light[1]) || opaqueBg(dark[1]);
+  const mainOpaque = opaqueBg(light[2]) || opaqueBg(dark[2]);
+  if (!bodyOpaque && !mainOpaque && opaqueBg(light[0]) && light[0] !== dark[0]) return true;
   return false;
 }
 
@@ -430,7 +413,22 @@ async function sampleThemeSignature(): Promise<string> {
           return `${cs.backgroundColor}|${cs.color}`;
         };
         const main = document.querySelector('main, [role="main"]');
-        return [pick(document.documentElement), pick(document.body), pick(main)].join('||');
+        const root = document.querySelector('#root, #__next, #app') || document.body;
+        let dialog: Element | null = null;
+        let best = 0;
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        for (const el of document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]')) {
+          const r = el.getBoundingClientRect();
+          if (r.width < 80 || r.height < 80) continue;
+          if (r.width >= vw * 0.9 && r.height >= vh * 0.9) continue;
+          const area = r.width * r.height;
+          if (area > best) {
+            best = area;
+            dialog = el;
+          }
+        }
+        return [pick(document.documentElement), pick(document.body), pick(main), pick(dialog), pick(root)].join('||');
       },
     });
     return String(result?.result ?? '');
@@ -439,14 +437,52 @@ async function sampleThemeSignature(): Promise<string> {
   }
 }
 
-async function readDialogCrop(): Promise<Rect | undefined> {
-  if (!activeTabId) return undefined;
+function rectContains(outer: Rect, inner: Rect, slack = 10): boolean {
+  return inner.x >= outer.x - slack
+    && inner.y >= outer.y - slack
+    && inner.x + inner.width <= outer.x + outer.width + slack
+    && inner.y + inner.height <= outer.y + outer.height + slack;
+}
+
+/** Keep a settled crop only when the clicked control is still inside it. */
+function cropKeepsTarget(next: Rect, target?: Rect, previous?: Rect): boolean {
+  if (next.width < 40 || next.height < 40) return false;
+  if (target && !rectContains(next, target, 16)) return false;
+  if (!previous) return true;
+  const nextArea = next.width * next.height;
+  const prevArea = previous.width * previous.height;
+  // A smaller crop is fine when it still holds the control. A crop that drops
+  // the previous modal (sidebar cut off) is not.
+  if (target) return true;
+  return nextArea >= prevArea * 0.85;
+}
+
+function elementRectMatchesClick(next: Rect, meta: ClickMeta): boolean {
+  const click = meta.coordinates;
+  const hit = !!click
+    && click.x >= next.x - 8
+    && click.x <= next.x + next.width + 8
+    && click.y >= next.y - 8
+    && click.y <= next.y + next.height + 8;
+  if (hit) return true;
+  return !!meta.elementRect && rectContains(next, meta.elementRect, 24) && rectContains(meta.elementRect, next, 24);
+}
+
+async function readDialogCrop(selector?: string): Promise<{ cropRect?: Rect; dialogName?: string; elementRect?: Rect }> {
+  if (!activeTabId) return {};
   try {
-    const response = await chrome.tabs.sendMessage(activeTabId, { type: 'GET_DIALOG_CROP' } as ExtensionMessage) as { cropRect?: Rect } | undefined;
+    const response = await chrome.tabs.sendMessage(activeTabId, {
+      type: 'GET_DIALOG_CROP',
+      payload: selector ? { selector } : undefined,
+    } as ExtensionMessage) as { cropRect?: Rect; dialogName?: string; elementRect?: Rect | null } | undefined;
     const r = response?.cropRect;
-    if (r && r.width >= 40 && r.height >= 40) return r;
+    const elementRect = response?.elementRect && response.elementRect.width >= 2 ? response.elementRect : undefined;
+    if (r && r.width >= 40 && r.height >= 40) {
+      return { cropRect: r, dialogName: response?.dialogName, elementRect };
+    }
+    return { elementRect };
   } catch { /* content script unavailable */ }
-  return undefined;
+  return {};
 }
 
 async function setEmulatedTheme(theme: 'light' | 'dark' | 'system') {
@@ -503,10 +539,14 @@ interface RawDualCapture {
   themeCapture: 'dual' | 'same';
 }
 
+/** Tabs that have already finished one dual-theme attempt this recording. */
+const dualCapturedTabs = new Set<number>();
+
 async function captureRawDual(themeSettleMs = 300, darkSettleMs = 300): Promise<RawDualCapture> {
   const result: RawDualCapture = { lightRaw: null, darkRaw: null, fallbackRaw: null, themeCapture: 'dual' };
   const originalTheme = state.theme;
   const paintFrame = 20;
+  const firstForTab = activeTabId == null || !dualCapturedTabs.has(activeTabId);
 
   try {
     await hideToolbar();
@@ -538,32 +578,25 @@ async function captureRawDual(themeSettleMs = 300, darkSettleMs = 300): Promise<
         await setEmulatedTheme('dark');
         await waitForThemePaint('dark');
 
-        let themeChanged = !lightSig;
         if (lightSig) {
-          for (let attempt = 0; attempt < 8; attempt++) {
+          // First capture of a tab waits about a second so a cold theme paint can land.
+          const maxAttempts = firstForTab ? 20 : 8;
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
             const darkSig = await sampleThemeSignature();
-            if (darkSig && pageThemeChanged(lightSig, darkSig)) {
-              themeChanged = true;
-              break;
-            }
+            if (darkSig && pageThemeChanged(lightSig, darkSig)) break;
             await new Promise((r) => setTimeout(r, 50));
           }
         }
 
-        if (!themeChanged) {
-          result.themeCapture = 'same';
-          result.darkRaw = null;
-        } else {
-          await new Promise((r) => setTimeout(r, Math.min(darkSettleMs, 200)));
-          const darkDataUrl = await captureWindow();
-          result.darkRaw = await (await globalThis.fetch(darkDataUrl)).blob();
-          try {
-            if (result.lightRaw && result.darkRaw && await framesLookSame(result.lightRaw, result.darkRaw)) {
-              result.themeCapture = 'same';
-              result.darkRaw = null;
-            }
-          } catch { /* keep dual */ }
-        }
+        // Always take the dark frame. A signature that has not moved yet is not
+        // proof the page has no dark theme — the pixel compare decides.
+        const darkSettle = firstForTab ? 900 : Math.max(darkSettleMs, 550);
+        await new Promise((r) => setTimeout(r, darkSettle));
+        const darkDataUrl = await captureWindow();
+        result.darkRaw = await (await globalThis.fetch(darkDataUrl)).blob();
+        result.themeCapture = 'dual';
+
+        if (activeTabId != null) dualCapturedTabs.add(activeTabId);
 
         await setEmulatedTheme(originalTheme === 'system' ? 'system' : originalTheme);
         await new Promise((r) => setTimeout(r, paintFrame));
@@ -704,6 +737,19 @@ async function handleEventCaptured(event: RecordedEvent, earlyAck?: () => void) 
     );
     dbg('captureRawDual:done', event.type, event.id);
 
+    if (isClick || isModal) {
+      const selector = (event.metadata as ClickMeta).selector;
+      const settled = await readDialogCrop(selector);
+      const meta = event.metadata as ClickMeta;
+      if (settled.cropRect && cropKeepsTarget(settled.cropRect, meta.elementRect, meta.cropRect)) {
+        meta.cropRect = settled.cropRect;
+        if (settled.dialogName && !meta.dialogName) meta.dialogName = settled.dialogName;
+      }
+      if (settled.elementRect && elementRectMatchesClick(settled.elementRect, meta)) {
+        meta.elementRect = settled.elementRect;
+      }
+    }
+
     // Release the click gate as soon as raw pixels exist — encode can finish after replay.
     earlyAck?.();
 
@@ -763,6 +809,7 @@ async function startRecording(tab: chrome.tabs.Tab) {
 
   activeTabId = tab.id ?? null;
   activeWindowId = tab.windowId ?? null;
+  dualCapturedTabs.clear();
 
   try {
     const { session } = await createSession(tab.url || '', tab.title);
@@ -785,10 +832,11 @@ async function startRecording(tab: chrome.tabs.Tab) {
 
   if (activeTabId) {
     try {
-      // Inject observer-patch into MAIN world only while recording
+      // Inject main-world helpers into the open tab. File injection
+      // bypasses the page's script-src policy; an inline script does not.
       await chrome.scripting.executeScript({
         target: { tabId: activeTabId, allFrames: true },
-        files: ['observer-patch.js'],
+        files: ['color-scheme-hook.js', 'observer-patch.js'],
         world: 'MAIN',
       });
     } catch { /* may already be present */ }
@@ -890,6 +938,7 @@ async function stopRecording() {
   activeTabId = null;
   activeWindowId = null;
   lastKnownUrl = '';
+  dualCapturedTabs.clear();
   failedUploadIds.clear();
   await clearPersistedState();
   broadcastState();
@@ -932,6 +981,7 @@ async function cancelRecording() {
   activeTabId = null;
   activeWindowId = null;
   lastKnownUrl = '';
+  dualCapturedTabs.clear();
   await clearPersistedState();
   broadcastState();
 }
@@ -1165,7 +1215,7 @@ chrome.runtime.onMessage.addListener(
         }
         case 'CAPTURE_SCREENSHOT': {
           if (!state.isRecording) return { error: 'Not recording' };
-          const cropRect = await readDialogCrop();
+          const settled = await readDialogCrop();
           const { mainId, altId, themeCapture } = await captureDualScreenshots();
           const event: RecordedEvent = {
             id: `manual-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -1177,7 +1227,7 @@ chrome.runtime.onMessage.addListener(
               label: 'Manual screenshot',
               skipHighlight: true,
               themeCapture,
-              cropRect,
+              cropRect: settled.cropRect,
             },
             screenshotId: mainId ?? undefined,
             altScreenshotId: altId ?? undefined,
@@ -1243,7 +1293,7 @@ function injectAndStart(tabId: number, allFrames: boolean, frameIds?: number[]) 
   const target = frameIds ? { tabId, frameIds } : { tabId, allFrames };
   chrome.scripting.executeScript({
     target,
-    files: ['observer-patch.js'],
+    files: ['color-scheme-hook.js', 'observer-patch.js'],
     world: 'MAIN',
   }).catch(() => {}).then(() =>
     chrome.scripting.executeScript({

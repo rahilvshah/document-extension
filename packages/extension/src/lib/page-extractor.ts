@@ -458,96 +458,423 @@ function isDialogElement(el: Element): boolean {
   }
 }
 
-function dialogContentElement(dialog: Element): Element {
-  const outer = dialog.getBoundingClientRect();
+const GENERIC_DIALOG_NAMES = new Set([
+  'dialog',
+  'alertdialog',
+  'div',
+  'section',
+  'form',
+  'menu',
+  'listbox',
+  'tooltip',
+]);
+
+function usefulDialogName(dialog: Element): string | undefined {
+  const name = overlayName(dialog).replace(/\s+/g, ' ').trim();
+  if (!name || GENERIC_DIALOG_NAMES.has(name.toLowerCase())) return undefined;
+  return name;
+}
+
+function isBackdropRect(rect: DOMRect): boolean {
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  const backdrop = outer.width >= vw * 0.9 && outer.height >= vh * 0.9;
-  if (!backdrop) return dialog;
+  return rect.width >= vw * 0.9 && rect.height >= vh * 0.9;
+}
 
+function isOpaqueSurface(el: Element): boolean {
+  try {
+    const bg = getComputedStyle(el).backgroundColor;
+    if (!bg || bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)') return false;
+    const match = bg.match(/rgba?\(([^)]+)\)/);
+    if (!match) return true;
+    const parts = match[1].split(',').map((part) => parseFloat(part.trim()));
+    if (parts.length === 4 && parts[3] < 0.85) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function unionClientRects(rects: DOMRect[]): DOMRect | null {
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+  for (const r of rects) {
+    if (r.width < 80 || r.height < 48) continue;
+    left = Math.min(left, r.left);
+    top = Math.min(top, r.top);
+    right = Math.max(right, r.right);
+    bottom = Math.max(bottom, r.bottom);
+  }
+  if (!Number.isFinite(left) || right - left < 80 || bottom - top < 80) return null;
+  return new DOMRect(left, top, right - left, bottom - top);
+}
+
+/** Sidebar + content panes under one modal wrapper, ignoring a stretched empty column. */
+function opaquePaneUnion(parent: Element): DOMRect | null {
+  const panes: DOMRect[] = [];
+  for (const child of Array.from(parent.children)) {
+    if (!isVisible(child)) continue;
+    const rect = child.getBoundingClientRect();
+    if (rect.width < 100 || rect.height < 64 || isBackdropRect(rect)) continue;
+    if (isOpaqueSurface(child)) {
+      panes.push(rect);
+      continue;
+    }
+    const inner = Array.from(child.children).find((node) => {
+      if (!isVisible(node) || !isOpaqueSurface(node)) return false;
+      const innerRect = node.getBoundingClientRect();
+      return innerRect.width >= 100 && innerRect.height >= 64 && !isBackdropRect(innerRect);
+    });
+    if (inner) panes.push(inner.getBoundingClientRect());
+  }
+  if (panes.length < 2) return panes[0] ?? null;
+  // Drop a pane that hangs well below the others — that is the empty page slab.
+  const shortest = Math.min(...panes.map((pane) => pane.height));
+  const fitted = panes.filter((pane) => pane.height <= shortest + 80);
+  return unionClientRects(fitted.length >= 2 ? fitted : panes);
+}
+
+/** App chrome. A persistent sidebar is not a modal, even when it is an opaque card. */
+function isPageChrome(el: Element): boolean {
+  const tag = el.tagName.toLowerCase();
+  const role = el.getAttribute('role') || '';
+  if (tag === 'nav' || tag === 'aside' || tag === 'header' || tag === 'main') return true;
+  return role === 'navigation' || role === 'complementary' || role === 'banner' || role === 'main';
+}
+
+/** Full modal box: the dialog card, or the sidebar and content panes inside a backdrop. */
+function modalBounds(shell: Element, dialog: Element | null): DOMRect {
+  const dialogRect = dialog?.getBoundingClientRect();
+  if (dialog && dialogRect && !isBackdropRect(dialogRect) && dialogRect.width >= 160 && dialogRect.height >= 120) {
+    return dialogRect;
+  }
+
+  const backdrop = dialog && dialogRect && isBackdropRect(dialogRect) ? dialog : null;
+  const backdropUnion = backdrop ? opaquePaneUnion(backdrop) : null;
+  if (backdropUnion && !isBackdropRect(backdropUnion)) return backdropUnion;
+
+  let node: Element | null = shell;
+  for (let depth = 0; node && depth < 5; depth++) {
+    const nodeRect = node.getBoundingClientRect();
+    if (isBackdropRect(nodeRect)) {
+      const union = opaquePaneUnion(node);
+      if (union && !isBackdropRect(union)) return union;
+    }
+    const parentEl: Element | null = node.parentElement;
+    if (!parentEl || parentEl === document.body || parentEl === document.documentElement) break;
+    const parentRect = parentEl.getBoundingClientRect();
+    const union = opaquePaneUnion(parentEl);
+    if (
+      union &&
+      union.width >= nodeRect.width + 36 &&
+      !isBackdropRect(union) &&
+      union.height <= window.innerHeight * 0.94
+    ) {
+      return union;
+    }
+    if (
+      !isBackdropRect(parentRect) &&
+      parentRect.width >= nodeRect.width + 48 &&
+      parentRect.height <= nodeRect.height + 64 &&
+      parentRect.height <= window.innerHeight * 0.94
+    ) {
+      return parentRect;
+    }
+    if (isBackdropRect(parentRect)) break;
+    node = parentEl;
+  }
+
+  return shell.getBoundingClientRect();
+}
+
+const DIALOG_SELECTOR =
+  'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"], [data-radix-dialog-content]';
+
+const MENU_SELECTOR =
+  '[role="menu"], [role="listbox"], [data-radix-menu-content], [data-radix-dropdown-menu-content]';
+
+/** Persistent left nav. A dropdown that overlaps it is shorter than this. */
+function isAppSidebarRect(rect: DOMRect): boolean {
+  return rect.left <= 28 && rect.top <= 28 && rect.width <= 420 && rect.height >= window.innerHeight * 0.72;
+}
+
+function isModalCardRect(rect: DOMRect): boolean {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  if (rect.width < 200 || rect.height < 160) return false;
+  if (isBackdropRect(rect) || isAppSidebarRect(rect)) return false;
+  if (rect.width >= vw * 0.92 && rect.height >= vh * 0.92) return false;
+  return (rect.width >= vw * 0.38 && rect.height >= vh * 0.3) || (rect.width >= 520 && rect.height >= 280);
+}
+
+function isExplicitMenu(el: Element): boolean {
+  const role = el.getAttribute('role') || '';
+  return role === 'menu' || role === 'listbox'
+    || el.hasAttribute('data-radix-menu-content')
+    || el.hasAttribute('data-radix-dropdown-menu-content');
+}
+
+function listDialogElements(): Element[] {
+  const dialogs: Element[] = [];
+  for (const el of document.querySelectorAll(DIALOG_SELECTOR)) {
+    if (!isVisible(el) || isPageChrome(el)) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 80 || rect.height < 80) continue;
+    dialogs.push(el);
+  }
+  return dialogs;
+}
+
+function largestModalCard(root: Element): Element | null {
   let best: Element | null = null;
   let bestArea = 0;
-  for (const node of dialog.querySelectorAll('div, section, form')) {
-    if (!isVisible(node)) continue;
-    const r = node.getBoundingClientRect();
-    if (r.width < 200 || r.height < 120) continue;
-    if (r.width >= vw * 0.92 && r.height >= vh * 0.92) continue;
-    const area = r.width * r.height;
+  const consider = (node: Element) => {
+    if (!isVisible(node) || isPageChrome(node)) return;
+    const rect = node.getBoundingClientRect();
+    if (!isModalCardRect(rect)) return;
+    const area = rect.width * rect.height;
     if (area > bestArea) {
       best = node;
       bestArea = area;
     }
-  }
-  return best || dialog;
+  };
+  consider(root);
+  for (const node of root.querySelectorAll('div, section, form')) consider(node);
+  return best;
 }
 
-/** Content box of the open dialog around `fromEl`, or the topmost open dialog. */
-export function extractDialogCropRect(fromEl?: Element | null): Rect | undefined {
+/** Largest real modal on the page, including the card sitting behind a confirm dialog. */
+function findBackingModal(): Element | null {
+  const dialogs = listDialogElements();
+  let best: Element | null = null;
+  let bestArea = 0;
+  const take = (el: Element | null) => {
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    if (!isModalCardRect(rect)) return;
+    const area = rect.width * rect.height;
+    if (area > bestArea) {
+      best = el;
+      bestArea = area;
+    }
+  };
+  for (const el of dialogs) {
+    const rect = el.getBoundingClientRect();
+    if (isModalCardRect(rect)) take(el);
+    else if (isBackdropRect(rect)) take(largestModalCard(el));
+  }
+  if (best) return best;
+  if (dialogs.length === 0) return null;
+  return findVisualModalCard();
+}
+
+function findVisualModalCard(): Element | null {
+  let best: Element | null = null;
+  let bestArea = 0;
+  const visit = (el: Element, depth: number) => {
+    if (depth > 8) return;
+    for (const child of Array.from(el.children)) {
+      if (!isVisible(child) || isPageChrome(child)) continue;
+      const rect = child.getBoundingClientRect();
+      if (rect.width < 200 || rect.height < 160) continue;
+      let position = '';
+      try { position = getComputedStyle(child).position; } catch { /* detached */ }
+      const floating = position === 'fixed' || position === 'absolute' || child.tagName.toLowerCase() === 'dialog';
+      if (floating && isModalCardRect(rect)) {
+        const area = rect.width * rect.height;
+        if (area > bestArea) {
+          best = child;
+          bestArea = area;
+        }
+        continue;
+      }
+      if (rect.width >= 400 && rect.height >= 240) visit(child, depth + 1);
+    }
+  };
+  visit(document.body, 0);
+  return best;
+}
+
+function rectsOverlap(a: DOMRect, b: DOMRect): boolean {
+  return a.left < b.right - 8 && a.right > b.left + 8 && a.top < b.bottom - 8 && a.bottom > b.top + 8;
+}
+
+function clickBelongsToModal(fromEl: Element | null | undefined, modal: Element): boolean {
+  if (!fromEl) return true;
+  if (modal.contains(fromEl)) return true;
+  const target = fromEl.getBoundingClientRect();
+  const modalRect = modal.getBoundingClientRect();
+  const cx = target.left + target.width / 2;
+  const cy = target.top + target.height / 2;
+  return pointInRect(cx, cy, modalRect) || rectsOverlap(target, modalRect);
+}
+
+function looksLikeMenuPanel(el: Element): boolean {
+  if (!isVisible(el) || isPageChrome(el)) return false;
+  const rect = el.getBoundingClientRect();
+  if (rect.width < 160 || rect.height < 88 || rect.width > 480) return false;
+  if (rect.height > window.innerHeight * 0.78) return false;
+  if (isAppSidebarRect(rect) || isBackdropRect(rect) || isModalCardRect(rect)) return false;
+  if (isExplicitMenu(el)) return true;
+  const items = el.querySelectorAll('[role="menuitem"], [role="menuitemcheckbox"], [role="option"], a, button');
+  return items.length >= 3 && items.length <= 24;
+}
+
+/** Dropdown that contains the click: heading and options, not the page sidebar. */
+function findMenuPanel(fromEl: Element, backing: Element | null): Element | null {
+  let node: Element | null = fromEl;
+  let best: Element | null = null;
+  for (let depth = 0; node && node !== document.body && depth < 14; depth++) {
+    if (looksLikeMenuPanel(node)) {
+      const insideModal = !!backing && backing.contains(node);
+      if (!insideModal || isExplicitMenu(node)) best = node;
+    }
+    const rect = node.getBoundingClientRect();
+    if (isAppSidebarRect(rect) || isModalCardRect(rect) || isBackdropRect(rect)) break;
+    node = node.parentElement;
+  }
+  if (best) {
+    const parent = best.parentElement;
+    if (parent && looksLikeMenuPanel(parent) && (!backing || !backing.contains(parent) || isExplicitMenu(parent))) {
+      return parent;
+    }
+    const parentRect = parent?.getBoundingClientRect();
+    const menuRect = best.getBoundingClientRect();
+    if (
+      parent &&
+      parentRect &&
+      !isAppSidebarRect(parentRect) &&
+      !isBackdropRect(parentRect) &&
+      !isModalCardRect(parentRect) &&
+      parentRect.width <= menuRect.width + 48 &&
+      parentRect.width <= 520 &&
+      parentRect.height <= menuRect.height + 180 &&
+      parentRect.height >= menuRect.height - 4
+    ) {
+      return parent;
+    }
+    return best;
+  }
+
+  const anchor = fromEl.getBoundingClientRect();
+  const cx = anchor.left + anchor.width / 2;
+  const cy = anchor.top + anchor.height / 2;
+  let tight: Element | null = null;
+  let tightArea = Infinity;
+  for (const candidate of document.querySelectorAll(MENU_SELECTOR)) {
+    if (!isVisible(candidate) || isPageChrome(candidate)) continue;
+    const rect = candidate.getBoundingClientRect();
+    if (!pointInRect(cx, cy, rect) || isAppSidebarRect(rect) || isBackdropRect(rect)) continue;
+    if (rect.width < 140 || rect.height < 72 || rect.width > 520) continue;
+    const area = rect.width * rect.height;
+    if (area < tightArea) {
+      tight = candidate;
+      tightArea = area;
+    }
+  }
+  return tight;
+}
+
+function finishCrop(
+  rect: DOMRect,
+  source: Element,
+  kind: 'modal' | 'menu',
+): { cropRect: Rect; dialogName?: string } | undefined {
+  const pad = kind === 'menu' ? 8 : 14;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const left = Math.max(0, rect.left - pad);
+  const top = Math.max(0, rect.top - pad);
+  const right = Math.min(vw, rect.right + pad);
+  const bottom = Math.min(vh, rect.bottom + pad);
+  const width = right - left;
+  const height = bottom - top;
+  if (width < 80 || height < 64) return undefined;
+  if (width >= vw * 0.92 && height >= vh * 0.92) return undefined;
+  if (kind === 'modal' && !isModalCardRect(new DOMRect(left, top, width, height))) return undefined;
+  if (kind === 'menu' && (isAppSidebarRect(new DOMRect(left, top, width, height)) || width > 560)) return undefined;
+  return {
+    cropRect: { x: left, y: top, width, height },
+    dialogName: usefulDialogName(source),
+  };
+}
+
+/**
+ * Crop a stacked confirm to the modal behind it, or a dropdown to its own panel.
+ * The app sidebar and the bare page stay full-frame.
+ */
+export function extractDialogCrop(fromEl?: Element | null): { cropRect: Rect; dialogName?: string } | undefined {
   try {
-    const dialog = findOpenDialog(fromEl);
-    if (!dialog) return undefined;
-    const content = dialogContentElement(dialog);
-    const r = content.getBoundingClientRect();
-    if (r.width < 80 || r.height < 80) return undefined;
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    if (r.width >= vw * 0.92 && r.height >= vh * 0.92) return undefined;
-    return { x: r.left, y: r.top, width: r.width, height: r.height };
+    const backing = findBackingModal();
+    if (fromEl) {
+      const menu = findMenuPanel(fromEl, backing);
+      if (menu) {
+        const cropped = finishCrop(menu.getBoundingClientRect(), menu, 'menu');
+        if (cropped) return cropped;
+      }
+    }
+    if (backing && clickBelongsToModal(fromEl, backing)) {
+      return finishCrop(modalBounds(backing, backing), backing, 'modal');
+    }
+    return undefined;
   } catch {
     return undefined;
   }
 }
 
+/** Content box of the open dialog around `fromEl`, or the largest open modal shell. */
+export function extractDialogCropRect(fromEl?: Element | null): Rect | undefined {
+  return extractDialogCrop(fromEl)?.cropRect;
+}
+
 function findOpenDialog(fromEl?: Element | null): Element | null {
-  const consider = (el: Element): DOMRect | null => {
-    if (!isDialogElement(el) || !isVisible(el)) return null;
+  const candidates: Element[] = [];
+  const seen = new Set<Element>();
+
+  const push = (el: Element) => {
+    if (seen.has(el)) return;
+    if (!isDialogElement(el) || !isVisible(el)) return;
     const rect = el.getBoundingClientRect();
-    if (rect.width < 80 || rect.height < 80) return null;
-    return rect;
-  };
-
-  let best: Element | null = null;
-  let bestArea = Infinity;
-
-  const offer = (el: Element) => {
-    const rect = consider(el);
-    if (!rect) return;
-    const area = rect.width * rect.height;
-    if (area < bestArea) {
-      best = el;
-      bestArea = area;
-    }
+    if (rect.width < 80 || rect.height < 80) return;
+    seen.add(el);
+    candidates.push(el);
   };
 
   if (fromEl) {
-    let current: Element | null = fromEl;
+    let current: Element | null = fromEl.parentElement;
     let depth = 0;
     while (current && depth < 25) {
-      if (current !== fromEl) offer(current);
+      push(current);
       current = current.parentElement;
       depth++;
     }
-    if (best) return best;
 
     const anchor = fromEl.getBoundingClientRect();
     const cx = anchor.left + anchor.width / 2;
     const cy = anchor.top + anchor.height / 2;
-    const candidates = document.querySelectorAll(
-      'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"], [data-radix-dialog-content]',
-    );
-    for (const candidate of candidates) {
-      const rect = consider(candidate);
-      if (!rect) continue;
+    for (const candidate of document.querySelectorAll(DIALOG_SELECTOR)) {
+      const rect = candidate.getBoundingClientRect();
       if (!candidate.contains(fromEl) && !pointInRect(cx, cy, rect)) continue;
-      offer(candidate);
+      push(candidate);
     }
-    return best;
+  } else {
+    for (const candidate of document.querySelectorAll(DIALOG_SELECTOR)) push(candidate);
   }
 
-  const candidates = document.querySelectorAll(
-    'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"], [data-radix-dialog-content]',
-  );
-  for (const candidate of candidates) offer(candidate);
+  const shells = candidates.filter((el) => !isBackdropRect(el.getBoundingClientRect()));
+  const pool = shells.length > 0 ? shells : candidates;
+  let best: Element | null = null;
+  let bestArea = 0;
+  for (const el of pool) {
+    const rect = el.getBoundingClientRect();
+    const area = rect.width * rect.height;
+    if (area > bestArea) {
+      best = el;
+      bestArea = area;
+    }
+  }
   return best;
 }
 
@@ -960,6 +1287,7 @@ export function extractAfterState(
   el: Element | null,
   beforeStates: ElementStates,
   beforeUrl: string,
+  beforeOverlays: string[] = [],
 ): AfterOutcome {
   try {
     let afterUrl = '';
@@ -1009,12 +1337,15 @@ export function extractAfterState(
       return { outcome: 'toggled', states: afterStates };
     }
 
-    if (overlays.length > 0) {
-      // Newly opened dialog/menu relative to interaction
+    const beforeSet = new Set(
+      beforeOverlays.map((n) => n.trim().toLowerCase()).filter(Boolean),
+    );
+    const newlyOpened = overlays.filter((n) => n.trim() && !beforeSet.has(n.trim().toLowerCase()));
+    if (newlyOpened.length > 0) {
       return {
         outcome: 'opened-dialog',
         states: afterStates,
-        openOverlayName: overlays[0],
+        openOverlayName: newlyOpened[0],
       };
     }
 

@@ -40,6 +40,8 @@ export const steps = sqliteTable('steps', {
   beforeDarkId: text('before_dark_id'),
   afterLightId: text('after_light_id'),
   afterDarkId: text('after_dark_id'),
+  annotatedAfterLightId: text('annotated_after_light_id'),
+  annotatedAfterDarkId: text('annotated_after_dark_id'),
   sourceEventIds: text('source_event_ids').notNull().default('[]'), // JSON array
   subSteps: text('sub_steps').notNull().default('[]'), // JSON array of SubStep
   mergeWithNextId: text('merge_with_next_id'),

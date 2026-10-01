@@ -50,6 +50,8 @@ sqlite.exec(`
     before_dark_id TEXT,
     after_light_id TEXT,
     after_dark_id TEXT,
+    annotated_after_light_id TEXT,
+    annotated_after_dark_id TEXT,
     source_event_ids TEXT NOT NULL DEFAULT '[]',
     sub_steps TEXT NOT NULL DEFAULT '[]',
     merge_with_next_id TEXT,
@@ -95,6 +97,8 @@ try { sqlite.exec('ALTER TABLE steps ADD COLUMN after_light_id TEXT'); } catch {
 try { sqlite.exec('ALTER TABLE steps ADD COLUMN after_dark_id TEXT'); } catch {}
 try { sqlite.exec('ALTER TABLE steps ADD COLUMN theme_capture TEXT'); } catch {}
 try { sqlite.exec('ALTER TABLE steps ADD COLUMN highlights TEXT'); } catch {}
+try { sqlite.exec('ALTER TABLE steps ADD COLUMN annotated_after_light_id TEXT'); } catch {}
+try { sqlite.exec('ALTER TABLE steps ADD COLUMN annotated_after_dark_id TEXT'); } catch {}
 
 export const db = drizzle(sqlite, { schema });
 
