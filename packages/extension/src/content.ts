@@ -16,6 +16,7 @@ import {
   extractAfterState,
   getElementStates,
   extractPageFrame,
+  extractDialogCropRect,
 } from './lib/page-extractor.js';
 import {
   enterEditMode,
@@ -63,6 +64,63 @@ let gateSafetyTimer: number | null = null;
 const HIGHLIGHT_PROMPT_TIMEOUT_MS = 4000;
 const BG_PIPELINE_BUDGET_MS = 2000;
 const GATE_SAFETY_TIMEOUT_MS = HIGHLIGHT_PROMPT_TIMEOUT_MS + BG_PIPELINE_BUDGET_MS;
+
+installColorSchemeHook();
+
+function installColorSchemeHook() {
+  try {
+    if (document.documentElement?.getAttribute('data-docext-scheme') === '1') return;
+    const script = document.createElement('script');
+    script.textContent = `(function(){
+      if (window.__docextSetColorScheme) return;
+      var native = window.matchMedia.bind(window);
+      var scheme = null;
+      var listeners = new Set();
+      function schemeMatches(query) {
+        var q = String(query);
+        var darkQ = q.indexOf('prefers-color-scheme') !== -1 && q.indexOf('dark') !== -1;
+        var lightQ = q.indexOf('prefers-color-scheme') !== -1 && q.indexOf('light') !== -1;
+        if (!darkQ && !lightQ) return null;
+        if (scheme === 'dark') return darkQ;
+        if (scheme === 'light') return lightQ;
+        return null;
+      }
+      window.matchMedia = function(query) {
+        var list = native(query);
+        var wrapped = {
+          media: String(query),
+          onchange: null,
+          addListener: function(fn) { listeners.add(fn); list.addListener(fn); },
+          removeListener: function(fn) { listeners.delete(fn); list.removeListener(fn); },
+          addEventListener: function(type, fn) { if (type === 'change') listeners.add(fn); list.addEventListener(type, fn); },
+          removeEventListener: function(type, fn) { listeners.delete(fn); list.removeEventListener(type, fn); },
+          dispatchEvent: function(ev) { return list.dispatchEvent(ev); }
+        };
+        Object.defineProperty(wrapped, 'matches', { get: function() {
+          var next = schemeMatches(query);
+          return next === null ? list.matches : next;
+        }});
+        return wrapped;
+      };
+      window.__docextSetColorScheme = function(next) {
+        scheme = next === 'dark' || next === 'light' ? next : null;
+        listeners.forEach(function(fn) {
+          try { fn({ matches: scheme === 'dark', media: '(prefers-color-scheme: ' + (scheme || 'light') + ')' }); } catch (e) {}
+        });
+      };
+      window.addEventListener('message', function(ev) {
+        if (ev.source !== window || !ev.data || ev.data.__docextColorScheme === undefined) return;
+        var t = ev.data.__docextColorScheme;
+        window.__docextSetColorScheme(t === 'dark' || t === 'light' ? t : null);
+      });
+    })();`;
+    const parent = document.documentElement || document.head;
+    if (!parent) return;
+    parent.appendChild(script);
+    script.remove();
+    document.documentElement.setAttribute('data-docext-scheme', '1');
+  } catch { /* document not ready */ }
+}
 
 // Guard against duplicate script injection
 const INJECTED_KEY = '__docext_injected';
@@ -350,13 +408,6 @@ function shouldCaptureAfter(
   return { capture: false, outcome };
 }
 
-function requestAfterCapture(eventId: string, outcome: ReturnType<typeof extractAfterState>) {
-  safeSendMessage({
-    type: 'CAPTURE_AFTER',
-    payload: { eventId, afterOutcome: outcome },
-  });
-}
-
 function afterReplayFlow(
   target: Element,
   label: string,
@@ -369,19 +420,33 @@ function afterReplayFlow(
   const settleMs = ephemeral ? 250 : 120;
   window.setTimeout(() => {
     const { capture, outcome } = shouldCaptureAfter(target, beforeStates, beforeUrl, beforeOverlayCount);
-    if (capture) {
-      requestAfterCapture(eventId, outcome);
-    }
-    if (isTopFrame) {
+    const revealPrompt = () => {
+      showToolbar();
+      if (!isTopFrame) return;
       showHighlightPrompt(
         label,
         () => {},
         () => safeSendMessage({ type: 'SET_SKIP_HIGHLIGHT', payload: { eventId } }),
         () => {
-          if (!capture) requestAfterCapture(eventId, outcome);
+          if (capture) return;
+          hideToolbar();
+          void safeSendMessage({
+            type: 'CAPTURE_AFTER',
+            payload: { eventId, afterOutcome: outcome },
+          }).finally(() => showToolbar());
         },
       );
+    };
+    if (capture) {
+      // Keep the toolbar out of the after shot, then show the prompt.
+      hideToolbar();
+      void safeSendMessage({
+        type: 'CAPTURE_AFTER',
+        payload: { eventId, afterOutcome: outcome },
+      }).finally(revealPrompt);
+      return;
     }
+    revealPrompt();
   }, settleMs);
 }
 
@@ -481,6 +546,7 @@ function handlePointerdown(e: PointerEvent) {
   });
 
   const ephemeral = isInsideEphemeralUI(target);
+  hideToolbar();
   const capturedEvent = buildClickEvent(target, e, info, getDomEdits(), { inEphemeralUI: ephemeral || undefined, hotPath: true });
   const label =
     (capturedEvent.metadata as { accessibleName?: string }).accessibleName ||
@@ -583,6 +649,7 @@ function handleClick(e: MouseEvent) {
   if (isDuplicateClick(info.selector, now)) return;
 
   const ephemeralFallback = isInsideEphemeralUI(target);
+  hideToolbar();
   const capturedEvent = buildClickEvent(target, e, info, getDomEdits(), {
     inEphemeralUI: ephemeralFallback || undefined,
     hotPath: true,
@@ -688,6 +755,7 @@ function handleKeydown(e: KeyboardEvent) {
     return;
   }
   const ephemeral = isInsideEphemeralUI(target);
+  hideToolbar();
   const fakeEvent = new MouseEvent('click', {
     bubbles: true,
     cancelable: true,
@@ -715,7 +783,7 @@ function handleKeydown(e: KeyboardEvent) {
       releaseGateThenReplay(() => {
         isReplayingClick = true;
         try {
-          if (typeof target.click === 'function') target.click();
+          if (target instanceof HTMLElement) target.click();
           else target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
         } finally {
           isReplayingClick = false;
@@ -845,22 +913,27 @@ function messageHandler(message: ExtensionMessage, _sender: chrome.runtime.Messa
       if (payload) {
         const savedFocus = document.activeElement;
         const html = document.documentElement;
-        if (payload.theme === 'dark') {
-          html.classList.add('dark');
-          html.setAttribute('data-theme', 'dark');
-          html.setAttribute('data-color-scheme', 'dark');
-          html.style.colorScheme = 'dark';
-        } else if (payload.theme === 'light') {
-          html.classList.remove('dark');
-          html.setAttribute('data-theme', 'light');
-          html.setAttribute('data-color-scheme', 'light');
-          html.style.colorScheme = 'light';
-        } else {
-          html.classList.remove('dark');
-          html.removeAttribute('data-theme');
-          html.removeAttribute('data-color-scheme');
-          html.style.colorScheme = '';
-        }
+        const applyThemeAttrs = (el: HTMLElement) => {
+          if (payload.theme === 'dark') {
+            el.classList.add('dark');
+            el.setAttribute('data-theme', 'dark');
+            el.setAttribute('data-color-scheme', 'dark');
+            el.style.colorScheme = 'dark';
+          } else if (payload.theme === 'light') {
+            el.classList.remove('dark');
+            el.setAttribute('data-theme', 'light');
+            el.setAttribute('data-color-scheme', 'light');
+            el.style.colorScheme = 'light';
+          } else {
+            el.classList.remove('dark');
+            el.removeAttribute('data-theme');
+            el.removeAttribute('data-color-scheme');
+            el.style.colorScheme = '';
+          }
+        };
+        applyThemeAttrs(html);
+        if (document.body) applyThemeAttrs(document.body);
+        window.postMessage({ __docextColorScheme: payload.theme }, '*');
         if (savedFocus instanceof HTMLElement) {
           try { savedFocus.focus({ preventScroll: true }); } catch {}
         }
@@ -884,6 +957,9 @@ function messageHandler(message: ExtensionMessage, _sender: chrome.runtime.Messa
       break;
     case 'GET_STATE':
       sendResponse({ isRecording, editMode: isEditMode() });
+      break;
+    case 'GET_DIALOG_CROP':
+      sendResponse({ cropRect: extractDialogCropRect() ?? null });
       break;
   }
   return true;

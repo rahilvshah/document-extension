@@ -19,6 +19,7 @@ import type {
   Step,
   DomEdit,
   HighlightSpec,
+  Rect,
 } from '@docext/shared';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -507,37 +508,56 @@ sessionsRouter.post('/:id/finalize', async (req, res) => {
       const { highlights, specs, viewportWidth, viewportHeight } = buildStepHighlights(step, sourceEvents);
       step.highlights = specs.length > 0 ? specs : undefined;
 
-      if (highlights.length === 0 || !viewportWidth || !viewportHeight) {
-        // No annotation — keep raw IDs as primary screenshots
-        continue;
-      }
-
-      // Annotate from raw before IDs (or merge-source screenshotId when it differs)
-      const lightSrc = step.beforeLightId ?? step.screenshotId;
-      const darkSrc = step.beforeDarkId ?? step.altScreenshotId;
+      const rawBeforeLight = step.beforeLightId ?? firstEv.screenshotId ?? step.screenshotId;
+      const rawBeforeDark = step.beforeDarkId ?? firstEv.altScreenshotId ?? step.altScreenshotId;
+      const rawAfterLight = step.afterLightId ?? lastEv.afterScreenshotId;
+      const rawAfterDark = step.afterDarkId ?? lastEv.afterAltScreenshotId;
 
       // For trigger→ephemeral style steps where screenshotId points at the popup
       // (last event), prefer that as the annotation source while keeping before* raw.
       const annotateLight =
-        step.screenshotId && step.screenshotId !== step.beforeLightId
+        step.screenshotId && step.screenshotId !== rawBeforeLight
           ? step.screenshotId
-          : lightSrc;
+          : rawBeforeLight;
       const annotateDark =
-        step.altScreenshotId && step.altScreenshotId !== step.beforeDarkId
+        step.altScreenshotId && step.altScreenshotId !== rawBeforeDark
           ? step.altScreenshotId
-          : darkSrc;
+          : rawBeforeDark;
 
-      const [annotatedLight, annotatedDark] = await Promise.all([
-        annotateLight
-          ? annotateAndSave(req.params.id, annotateLight, highlights, viewportWidth, viewportHeight, ssMap)
+      const lightCrop = cropRectFromEvents(sourceEvents, annotateLight);
+      const darkCrop = cropRectFromEvents(sourceEvents, annotateDark) ?? lightCrop;
+      const cropAfter = afterKeepsCrop(sourceEvents);
+      const canDraw = highlights.length > 0 && !!viewportWidth && !!viewportHeight;
+
+      const [annotatedLight, annotatedDark, cleanLight, cleanDark, croppedAfterLight, croppedAfterDark] = await Promise.all([
+        canDraw && annotateLight
+          ? annotateAndSave(req.params.id, annotateLight, highlights, viewportWidth, viewportHeight, ssMap, lightCrop)
           : Promise.resolve(null),
-        annotateDark
-          ? annotateAndSave(req.params.id, annotateDark, highlights, viewportWidth, viewportHeight, ssMap)
+        canDraw && annotateDark
+          ? annotateAndSave(req.params.id, annotateDark, highlights, viewportWidth, viewportHeight, ssMap, darkCrop)
+          : Promise.resolve(null),
+        rawBeforeLight && lightCrop && viewportWidth
+          ? annotateAndSave(req.params.id, rawBeforeLight, [], viewportWidth, viewportHeight, ssMap, lightCrop)
+          : Promise.resolve(null),
+        rawBeforeDark && darkCrop && viewportWidth
+          ? annotateAndSave(req.params.id, rawBeforeDark, [], viewportWidth, viewportHeight, ssMap, darkCrop)
+          : Promise.resolve(null),
+        cropAfter && rawAfterLight && lightCrop && viewportWidth
+          ? annotateAndSave(req.params.id, rawAfterLight, [], viewportWidth, viewportHeight, ssMap, lightCrop)
+          : Promise.resolve(null),
+        cropAfter && rawAfterDark && darkCrop && viewportWidth
+          ? annotateAndSave(req.params.id, rawAfterDark, [], viewportWidth, viewportHeight, ssMap, darkCrop)
           : Promise.resolve(null),
       ]);
 
+      if (cleanLight) step.beforeLightId = cleanLight;
+      if (cleanDark) step.beforeDarkId = cleanDark;
+      if (croppedAfterLight) step.afterLightId = croppedAfterLight;
+      if (croppedAfterDark) step.afterDarkId = croppedAfterDark;
       if (annotatedLight) step.screenshotId = annotatedLight;
+      else if (cleanLight) step.screenshotId = cleanLight;
       if (annotatedDark) step.altScreenshotId = annotatedDark;
+      else if (cleanDark) step.altScreenshotId = cleanDark;
     }
 
     if (steps.length > 0) {
@@ -556,6 +576,42 @@ sessionsRouter.post('/:id/finalize', async (req, res) => {
   }
 });
 
+function metaCropRect(meta: unknown): Rect | undefined {
+  const r = (meta as { cropRect?: Rect } | null)?.cropRect;
+  if (!r || r.width < 40 || r.height < 40) return undefined;
+  return r;
+}
+
+function cropRectFromEvents(events: RecordedEvent[], screenshotId?: string): Rect | undefined {
+  if (screenshotId) {
+    for (const ev of events) {
+      if (
+        ev.screenshotId === screenshotId ||
+        ev.altScreenshotId === screenshotId ||
+        ev.afterScreenshotId === screenshotId ||
+        ev.afterAltScreenshotId === screenshotId
+      ) {
+        const r = metaCropRect(ev.metadata);
+        if (r) return r;
+      }
+    }
+  }
+  for (const ev of events) {
+    const r = metaCropRect(ev.metadata);
+    if (r) return r;
+  }
+  return undefined;
+}
+
+function afterKeepsCrop(events: RecordedEvent[]): boolean {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const outcome = (events[i].metadata as ClickMeta).afterOutcome?.outcome;
+    if (!outcome) continue;
+    return outcome !== 'navigated' && outcome !== 'opened-dialog';
+  }
+  return true;
+}
+
 async function annotateAndSave(
   sessionId: string,
   rawScreenshotId: string,
@@ -563,6 +619,7 @@ async function annotateAndSave(
   viewportWidth: number,
   viewportHeight: number,
   ssMap?: Map<string, ScreenshotRow>,
+  cropRect?: Rect,
 ): Promise<string | null> {
   try {
     const ssRow = ssMap?.get(rawScreenshotId) ?? await db.query.screenshots.findFirst({
@@ -577,6 +634,7 @@ async function annotateAndSave(
       highlights,
       viewportWidth,
       viewportHeight,
+      cropRect,
     });
 
     const newId = uuid();
@@ -748,40 +806,73 @@ sessionsRouter.post('/:id/merge-steps', async (req, res) => {
     const lastSourceIds = lastStep.sourceEventIds;
     const lastEvents = eventRows.filter((e) => lastSourceIds.includes(e.id));
 
+    const lastRecorded = lastEvents.map((row) => eventRowToRecorded(row));
+    const allRecorded = eventRows.map((row) => eventRowToRecorded(row));
     const rawLight =
-      lastStep.beforeLightId
-      ?? lastEvents.find((e) => e.screenshotId)?.screenshotId
+      lastRecorded.find((e) => e.screenshotId)?.screenshotId
+      ?? lastStep.beforeLightId
       ?? lastStep.screenshotId;
     const rawDark =
-      lastStep.beforeDarkId
-      ?? lastEvents.find((e) => e.altScreenshotId)?.altScreenshotId
+      lastRecorded.find((e) => e.altScreenshotId)?.altScreenshotId
+      ?? lastStep.beforeDarkId
       ?? lastStep.altScreenshotId;
 
-    const beforeLightId = firstStep.beforeLightId ?? firstStep.screenshotId;
-    const beforeDarkId = firstStep.beforeDarkId ?? firstStep.altScreenshotId;
-    const afterLightId =
-      lastStep.afterLightId
-      ?? lastEvents.find((e) => e.afterScreenshotId)?.afterScreenshotId
-      ?? rawLight;
-    const afterDarkId =
-      lastStep.afterDarkId
-      ?? lastEvents.find((e) => e.afterAltScreenshotId)?.afterAltScreenshotId
-      ?? rawDark;
+    const beforeLightRaw =
+      allRecorded.find((e) => e.id && firstStep.sourceEventIds.includes(e.id) && e.screenshotId)?.screenshotId
+      ?? firstStep.beforeLightId
+      ?? firstStep.screenshotId;
+    const beforeDarkRaw =
+      allRecorded.find((e) => firstStep.sourceEventIds.includes(e.id) && e.altScreenshotId)?.altScreenshotId
+      ?? firstStep.beforeDarkId
+      ?? firstStep.altScreenshotId;
+    const afterLightRaw =
+      lastRecorded.find((e) => e.afterScreenshotId)?.afterScreenshotId
+      ?? lastStep.afterLightId;
+    const afterDarkRaw =
+      lastRecorded.find((e) => e.afterAltScreenshotId)?.afterAltScreenshotId
+      ?? lastStep.afterDarkId;
+
+    const lightCrop = cropRectFromEvents(lastRecorded, rawLight) ?? cropRectFromEvents(allRecorded, rawLight);
+    const darkCrop = cropRectFromEvents(lastRecorded, rawDark) ?? lightCrop;
+    const cropAfter = afterKeepsCrop(allRecorded);
 
     let newScreenshotId = rawLight;
     let newAltScreenshotId = rawDark;
+    let beforeLightId = beforeLightRaw;
+    let beforeDarkId = beforeDarkRaw;
+    let afterLightId = afterLightRaw;
+    let afterDarkId = afterDarkRaw;
 
-    if (highlights.length > 0 && viewportWidth && viewportHeight) {
-      const [annotatedLight, annotatedDark] = await Promise.all([
-        rawLight
-          ? annotateAndSave(sessionId, rawLight, highlights, viewportWidth, viewportHeight, ssMap)
+    if (viewportWidth && viewportHeight) {
+      const canDraw = highlights.length > 0;
+      const [annotatedLight, annotatedDark, cleanLight, cleanDark, croppedAfterLight, croppedAfterDark] = await Promise.all([
+        canDraw && rawLight
+          ? annotateAndSave(sessionId, rawLight, highlights, viewportWidth, viewportHeight, ssMap, lightCrop)
           : Promise.resolve(null),
-        rawDark
-          ? annotateAndSave(sessionId, rawDark, highlights, viewportWidth, viewportHeight, ssMap)
+        canDraw && rawDark
+          ? annotateAndSave(sessionId, rawDark, highlights, viewportWidth, viewportHeight, ssMap, darkCrop)
+          : Promise.resolve(null),
+        beforeLightRaw && lightCrop
+          ? annotateAndSave(sessionId, beforeLightRaw, [], viewportWidth, viewportHeight, ssMap, lightCrop)
+          : Promise.resolve(null),
+        beforeDarkRaw && darkCrop
+          ? annotateAndSave(sessionId, beforeDarkRaw, [], viewportWidth, viewportHeight, ssMap, darkCrop)
+          : Promise.resolve(null),
+        cropAfter && afterLightRaw && lightCrop
+          ? annotateAndSave(sessionId, afterLightRaw, [], viewportWidth, viewportHeight, ssMap, lightCrop)
+          : Promise.resolve(null),
+        cropAfter && afterDarkRaw && darkCrop
+          ? annotateAndSave(sessionId, afterDarkRaw, [], viewportWidth, viewportHeight, ssMap, darkCrop)
           : Promise.resolve(null),
       ]);
       if (annotatedLight) newScreenshotId = annotatedLight;
+      else if (cleanLight) newScreenshotId = cleanLight;
       if (annotatedDark) newAltScreenshotId = annotatedDark;
+      else if (cleanDark) newAltScreenshotId = cleanDark;
+      if (cleanLight) beforeLightId = cleanLight;
+      if (cleanDark) beforeDarkId = cleanDark;
+      if (croppedAfterLight) afterLightId = croppedAfterLight;
+      if (croppedAfterDark) afterDarkId = croppedAfterDark;
     }
 
     // Use the sort order of the first step in the group
@@ -942,8 +1033,16 @@ sessionsRouter.patch('/:id/events/:eventId/skip-highlight', async (req, res) => 
           .filter((e): e is RecordedEvent => !!e);
         const { highlights, specs, viewportWidth, viewportHeight } = buildStepHighlights(step, sourceEvents);
 
-        const lightSrc = step.beforeLightId ?? step.screenshotId;
-        const darkSrc = step.beforeDarkId ?? step.altScreenshotId;
+        const lightSrc =
+          sourceEvents.find((e) => e.screenshotId)?.screenshotId
+          ?? step.beforeLightId
+          ?? step.screenshotId;
+        const darkSrc =
+          sourceEvents.find((e) => e.altScreenshotId)?.altScreenshotId
+          ?? step.beforeDarkId
+          ?? step.altScreenshotId;
+        const lightCrop = cropRectFromEvents(sourceEvents, lightSrc);
+        const darkCrop = cropRectFromEvents(sourceEvents, darkSrc) ?? lightCrop;
 
         let newLight = step.screenshotId;
         let newDark = step.altScreenshotId;
@@ -951,10 +1050,10 @@ sessionsRouter.patch('/:id/events/:eventId/skip-highlight', async (req, res) => 
         if (highlights.length > 0 && viewportWidth && viewportHeight) {
           const [annotatedLight, annotatedDark] = await Promise.all([
             lightSrc
-              ? annotateAndSave(sessionId, lightSrc, highlights, viewportWidth, viewportHeight, ssMap)
+              ? annotateAndSave(sessionId, lightSrc, highlights, viewportWidth, viewportHeight, ssMap, lightCrop)
               : Promise.resolve(null),
             darkSrc
-              ? annotateAndSave(sessionId, darkSrc, highlights, viewportWidth, viewportHeight, ssMap)
+              ? annotateAndSave(sessionId, darkSrc, highlights, viewportWidth, viewportHeight, ssMap, darkCrop)
               : Promise.resolve(null),
           ]);
           if (annotatedLight) newLight = annotatedLight;

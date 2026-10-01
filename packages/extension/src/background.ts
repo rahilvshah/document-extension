@@ -1,4 +1,4 @@
-import type { RecordedEvent, RecordingState, ExtensionMessage, ClickMeta } from '@docext/shared';
+import type { RecordedEvent, RecordingState, ExtensionMessage, ClickMeta, Rect } from '@docext/shared';
 import { storeEvent, updateEventSkipHighlight, updateEventAfterScreenshots, storeScreenshot, getAllEvents, getScreenshotsByIds, clearAll, deleteByIds, hasPendingData } from './lib/idb-store.js';
 import { createSession, uploadEvents, uploadScreenshotBlob, finalizeSession, deleteSession, uploadDomEdits, patchSkipHighlight } from './lib/api-client.js';
 
@@ -192,10 +192,37 @@ async function hideToolbar() {
         target: { tabId: activeTabId },
         func: () => {
           const el = document.getElementById('docext-toolbar');
-          if (el) el.style.display = 'none';
+          if (!el) return;
+          el.style.display = 'none';
+          el.style.visibility = 'hidden';
+          el.style.opacity = '0';
+          el.style.transform = 'translate(-50%, 200vh)';
         },
       });
     } catch { /* tab closed or restricted */ }
+  }
+}
+
+/** Hide the toolbar and wait until that hide has been painted before a capture. */
+async function hideToolbarAndPaint() {
+  if (!activeTabId) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: activeTabId },
+      func: () => new Promise<void>((resolve) => {
+        const el = document.getElementById('docext-toolbar');
+        if (el) {
+          el.style.display = 'none';
+          el.style.visibility = 'hidden';
+          el.style.opacity = '0';
+          el.style.transform = 'translate(-50%, 200vh)';
+          void el.offsetHeight;
+        }
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      }),
+    });
+  } catch {
+    await hideToolbar();
   }
 }
 
@@ -209,7 +236,11 @@ async function showToolbar() {
         target: { tabId: activeTabId },
         func: () => {
           const el = document.getElementById('docext-toolbar');
-          if (el) el.style.display = '';
+          if (!el) return;
+          el.style.display = '';
+          el.style.visibility = '';
+          el.style.opacity = '';
+          el.style.transform = 'translateX(-50%)';
         },
       });
     } catch { /* tab closed or restricted */ }
@@ -222,6 +253,7 @@ async function showToolbar() {
 // "currently visible" tab. If the user switches tabs mid-recording we'd
 // otherwise toggle theme on the recording tab and capture an unrelated one.
 async function captureWindow(): Promise<string> {
+  await hideToolbarAndPaint();
   const opts: chrome.tabs.CaptureVisibleTabOptions = { format: 'jpeg', quality: 90 };
   if (activeWindowId != null) {
     return chrome.tabs.captureVisibleTab(activeWindowId, opts);
@@ -242,16 +274,28 @@ async function toWebp(blob: Blob): Promise<Blob> {
   return out;
 }
 
-/** Cheap sample of blob bytes for identical-frame detection. */
-async function sampleBlobHash(blob: Blob): Promise<string> {
-  const slice = blob.slice(0, Math.min(blob.size, 4096));
-  const buf = await slice.arrayBuffer();
-  const view = new Uint8Array(buf);
-  let h = blob.size;
-  for (let i = 0; i < view.length; i += 17) {
-    h = ((h * 31) + view[i]) >>> 0;
+/** Downscaled pixel compare so near-identical light/dark frames are dropped. */
+async function framesLookSame(a: Blob, b: Blob): Promise<boolean> {
+  const [ia, ib] = await Promise.all([createImageBitmap(a), createImageBitmap(b)]);
+  try {
+    const size = 16;
+    const canvas = new OffscreenCanvas(size, size);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return false;
+    ctx.drawImage(ia, 0, 0, size, size);
+    const pa = ctx.getImageData(0, 0, size, size).data;
+    ctx.drawImage(ib, 0, 0, size, size);
+    const pb = ctx.getImageData(0, 0, size, size).data;
+    let diff = 0;
+    const pixels = size * size;
+    for (let i = 0; i < pa.length; i += 4) {
+      diff += Math.abs(pa[i] - pb[i]) + Math.abs(pa[i + 1] - pb[i + 1]) + Math.abs(pa[i + 2] - pb[i + 2]);
+    }
+    return diff / (pixels * 3) < 12;
+  } finally {
+    ia.close();
+    ib.close();
   }
-  return `${blob.size}:${h}`;
 }
 
 // ── Page Observer Pausing ──
@@ -324,8 +368,90 @@ async function waitForThemePaint(targetTheme: 'light' | 'dark' | 'system'): Prom
   } catch { /* tab may be restricted or closed — proceed anyway */ }
 }
 
+async function applyThemeInPage(theme: 'light' | 'dark' | 'system') {
+  if (!activeTabId) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: activeTabId },
+      world: 'MAIN',
+      args: [theme],
+      func: (t: 'light' | 'dark' | 'system') => {
+        const apply = (el: HTMLElement | null) => {
+          if (!el) return;
+          if (t === 'dark') {
+            el.classList.add('dark');
+            el.setAttribute('data-theme', 'dark');
+            el.setAttribute('data-color-scheme', 'dark');
+            el.style.colorScheme = 'dark';
+          } else if (t === 'light') {
+            el.classList.remove('dark');
+            el.setAttribute('data-theme', 'light');
+            el.setAttribute('data-color-scheme', 'light');
+            el.style.colorScheme = 'light';
+          } else {
+            el.classList.remove('dark');
+            el.removeAttribute('data-theme');
+            el.removeAttribute('data-color-scheme');
+            el.style.colorScheme = '';
+          }
+        };
+        apply(document.documentElement);
+        apply(document.body);
+        const set = (window as unknown as { __docextSetColorScheme?: (v: string | null) => void }).__docextSetColorScheme;
+        set?.(t === 'system' ? null : t);
+      },
+    });
+  } catch { /* tab may be restricted */ }
+}
+
+function pageThemeChanged(lightSig: string, darkSig: string): boolean {
+  const opaqueBg = (part: string | undefined) => {
+    const bg = (part || '').split('|')[0] || '';
+    return bg !== '' && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)';
+  };
+  const [htmlL, bodyL, mainL] = lightSig.split('||');
+  const [htmlD, bodyD, mainD] = darkSig.split('||');
+  if (opaqueBg(bodyL) && bodyL !== bodyD) return true;
+  if (opaqueBg(mainL) && mainL !== mainD) return true;
+  if (!opaqueBg(bodyL) && !opaqueBg(mainL) && opaqueBg(htmlL) && htmlL !== htmlD) return true;
+  return false;
+}
+
+async function sampleThemeSignature(): Promise<string> {
+  if (!activeTabId) return '';
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: activeTabId },
+      world: 'MAIN',
+      func: () => {
+        const pick = (el: Element | null) => {
+          if (!el) return '';
+          const cs = getComputedStyle(el);
+          return `${cs.backgroundColor}|${cs.color}`;
+        };
+        const main = document.querySelector('main, [role="main"]');
+        return [pick(document.documentElement), pick(document.body), pick(main)].join('||');
+      },
+    });
+    return String(result?.result ?? '');
+  } catch {
+    return '';
+  }
+}
+
+async function readDialogCrop(): Promise<Rect | undefined> {
+  if (!activeTabId) return undefined;
+  try {
+    const response = await chrome.tabs.sendMessage(activeTabId, { type: 'GET_DIALOG_CROP' } as ExtensionMessage) as { cropRect?: Rect } | undefined;
+    const r = response?.cropRect;
+    if (r && r.width >= 40 && r.height >= 40) return r;
+  } catch { /* content script unavailable */ }
+  return undefined;
+}
+
 async function setEmulatedTheme(theme: 'light' | 'dark' | 'system') {
   if (!activeTabId) return;
+  await applyThemeInPage(theme);
   try {
     await chrome.tabs.sendMessage(activeTabId, {
       type: 'TOGGLE_THEME',
@@ -408,24 +534,36 @@ async function captureRawDual(themeSettleMs = 300, darkSettleMs = 300): Promise<
           return id;
         }).catch(() => null);
 
+        const lightSig = await sampleThemeSignature();
         await setEmulatedTheme('dark');
         await waitForThemePaint('dark');
-        await new Promise((r) => setTimeout(r, Math.min(darkSettleMs, 200)));
 
-        const darkDataUrl = await captureWindow();
-        result.darkRaw = await (await globalThis.fetch(darkDataUrl)).blob();
-
-        // Identical-frame detection
-        try {
-          const [lh, dh] = await Promise.all([
-            sampleBlobHash(result.lightRaw),
-            sampleBlobHash(result.darkRaw),
-          ]);
-          if (lh === dh) {
-            result.themeCapture = 'same';
-            result.darkRaw = null;
+        let themeChanged = !lightSig;
+        if (lightSig) {
+          for (let attempt = 0; attempt < 8; attempt++) {
+            const darkSig = await sampleThemeSignature();
+            if (darkSig && pageThemeChanged(lightSig, darkSig)) {
+              themeChanged = true;
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 50));
           }
-        } catch { /* keep dual */ }
+        }
+
+        if (!themeChanged) {
+          result.themeCapture = 'same';
+          result.darkRaw = null;
+        } else {
+          await new Promise((r) => setTimeout(r, Math.min(darkSettleMs, 200)));
+          const darkDataUrl = await captureWindow();
+          result.darkRaw = await (await globalThis.fetch(darkDataUrl)).blob();
+          try {
+            if (result.lightRaw && result.darkRaw && await framesLookSame(result.lightRaw, result.darkRaw)) {
+              result.themeCapture = 'same';
+              result.darkRaw = null;
+            }
+          } catch { /* keep dual */ }
+        }
 
         await setEmulatedTheme(originalTheme === 'system' ? 'system' : originalTheme);
         await new Promise((r) => setTimeout(r, paintFrame));
@@ -1027,6 +1165,7 @@ chrome.runtime.onMessage.addListener(
         }
         case 'CAPTURE_SCREENSHOT': {
           if (!state.isRecording) return { error: 'Not recording' };
+          const cropRect = await readDialogCrop();
           const { mainId, altId, themeCapture } = await captureDualScreenshots();
           const event: RecordedEvent = {
             id: `manual-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -1038,6 +1177,7 @@ chrome.runtime.onMessage.addListener(
               label: 'Manual screenshot',
               skipHighlight: true,
               themeCapture,
+              cropRect,
             },
             screenshotId: mainId ?? undefined,
             altScreenshotId: altId ?? undefined,

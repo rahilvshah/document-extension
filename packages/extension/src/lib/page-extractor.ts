@@ -445,6 +445,112 @@ function overlayName(el: Element): string {
   );
 }
 
+function isDialogElement(el: Element): boolean {
+  try {
+    const role = el.getAttribute('role') || '';
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'dialog' || role === 'dialog' || role === 'alertdialog') return true;
+    if (el.getAttribute('aria-modal') === 'true') return true;
+    if (el.hasAttribute('data-radix-dialog-content')) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function dialogContentElement(dialog: Element): Element {
+  const outer = dialog.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const backdrop = outer.width >= vw * 0.9 && outer.height >= vh * 0.9;
+  if (!backdrop) return dialog;
+
+  let best: Element | null = null;
+  let bestArea = 0;
+  for (const node of dialog.querySelectorAll('div, section, form')) {
+    if (!isVisible(node)) continue;
+    const r = node.getBoundingClientRect();
+    if (r.width < 200 || r.height < 120) continue;
+    if (r.width >= vw * 0.92 && r.height >= vh * 0.92) continue;
+    const area = r.width * r.height;
+    if (area > bestArea) {
+      best = node;
+      bestArea = area;
+    }
+  }
+  return best || dialog;
+}
+
+/** Content box of the open dialog around `fromEl`, or the topmost open dialog. */
+export function extractDialogCropRect(fromEl?: Element | null): Rect | undefined {
+  try {
+    const dialog = findOpenDialog(fromEl);
+    if (!dialog) return undefined;
+    const content = dialogContentElement(dialog);
+    const r = content.getBoundingClientRect();
+    if (r.width < 80 || r.height < 80) return undefined;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    if (r.width >= vw * 0.92 && r.height >= vh * 0.92) return undefined;
+    return { x: r.left, y: r.top, width: r.width, height: r.height };
+  } catch {
+    return undefined;
+  }
+}
+
+function findOpenDialog(fromEl?: Element | null): Element | null {
+  const consider = (el: Element): DOMRect | null => {
+    if (!isDialogElement(el) || !isVisible(el)) return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 80 || rect.height < 80) return null;
+    return rect;
+  };
+
+  let best: Element | null = null;
+  let bestArea = Infinity;
+
+  const offer = (el: Element) => {
+    const rect = consider(el);
+    if (!rect) return;
+    const area = rect.width * rect.height;
+    if (area < bestArea) {
+      best = el;
+      bestArea = area;
+    }
+  };
+
+  if (fromEl) {
+    let current: Element | null = fromEl;
+    let depth = 0;
+    while (current && depth < 25) {
+      if (current !== fromEl) offer(current);
+      current = current.parentElement;
+      depth++;
+    }
+    if (best) return best;
+
+    const anchor = fromEl.getBoundingClientRect();
+    const cx = anchor.left + anchor.width / 2;
+    const cy = anchor.top + anchor.height / 2;
+    const candidates = document.querySelectorAll(
+      'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"], [data-radix-dialog-content]',
+    );
+    for (const candidate of candidates) {
+      const rect = consider(candidate);
+      if (!rect) continue;
+      if (!candidate.contains(fromEl) && !pointInRect(cx, cy, rect)) continue;
+      offer(candidate);
+    }
+    return best;
+  }
+
+  const candidates = document.querySelectorAll(
+    'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"], [data-radix-dialog-content]',
+  );
+  for (const candidate of candidates) offer(candidate);
+  return best;
+}
+
 function findOpenOverlayContaining(el: Element): Element | null {
   try {
     // Ancestor walk first

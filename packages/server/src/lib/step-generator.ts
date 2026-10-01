@@ -38,6 +38,7 @@ interface RawStep {
   viewportSize?: { width: number; height: number };
   inEphemeralUI?: boolean;
   containerRole?: string;
+  openOverlays?: string[];
   subSteps?: SubStep[];
   mergeWithNextId?: string;
   themeCapture?: 'dual' | 'same';
@@ -475,6 +476,7 @@ export function generateSteps(
       viewportSize: meta.viewportSize,
       inEphemeralUI: (meta as ClickMeta).inEphemeralUI || undefined,
       containerRole: (meta as ClickMeta).containerRole || undefined,
+      openOverlays: meta.openOverlays,
       themeCapture: meta.themeCapture,
     });
   }
@@ -561,6 +563,7 @@ function adoptLaterShots(prev: RawStep, step: RawStep): void {
   if (step.afterLightId) prev.afterLightId = step.afterLightId;
   if (step.afterDarkId) prev.afterDarkId = step.afterDarkId;
   if (step.themeCapture) prev.themeCapture = step.themeCapture;
+  if (!prev.openOverlays?.length && step.openOverlays?.length) prev.openOverlays = step.openOverlays;
 }
 
 const SCROLL_THRESHOLD = 50;
@@ -687,6 +690,7 @@ function groupSameAreaSteps(steps: RawStep[]): RawStep[] {
       viewportSize: current.viewportSize,
       scrollPosition: current.scrollPosition,
       themeCapture: firstStep.themeCapture,
+      openOverlays: firstStep.openOverlays,
       subSteps,
     });
 
@@ -713,22 +717,36 @@ function groupSameAreaSteps(steps: RawStep[]): RawStep[] {
  * We therefore attach a stable token (index-based) that generateSteps
  * replaces with the real UUID after mapping.
  */
+const MERGE_IGNORE_OVERLAYS = new Set(['menu', 'listbox', 'tooltip']);
+
+function sharedDialogName(a: RawStep, b: RawStep): boolean {
+  const names = new Set(
+    (a.openOverlays ?? []).map((n) => n.trim().toLowerCase()).filter((n) => n && !MERGE_IGNORE_OVERLAYS.has(n)),
+  );
+  if (names.size === 0) return false;
+  return (b.openOverlays ?? []).some((n) => names.has(n.trim().toLowerCase()));
+}
+
+function canLinkSteps(current: RawStep, next: RawStep, maxGapMs: number): boolean {
+  return !!(
+    next.elementRect &&
+    next.url &&
+    current.url &&
+    stripHash(next.url) === stripHash(current.url) &&
+    next.timestamp - current.timestamp <= maxGapMs &&
+    next.timestamp >= current.timestamp
+  );
+}
+
 function detectMergeableGroups(steps: RawStep[]): RawStep[] {
   const result: RawStep[] = [...steps];
 
   for (let i = 0; i < result.length; i++) {
     const current = result[i];
-    if (current.inEphemeralUI || !current.elementRect || !current.url) continue;
+    if (current.mergeWithNextId || current.inEphemeralUI || !current.elementRect || !current.url) continue;
 
     const next = i + 1 < result.length ? result[i + 1] : null;
-    if (
-      !next ||
-      !next.inEphemeralUI ||
-      !next.elementRect ||
-      !next.url ||
-      stripHash(next.url) !== stripHash(current.url) ||
-      next.timestamp - current.timestamp > 10_000
-    ) continue;
+    if (!next || !canLinkSteps(current, next, 10_000) || !next.inEphemeralUI) continue;
 
     // Mark trigger → first ephemeral
     // We store a sentinel that will be replaced with the real UUID after mapping.
@@ -736,15 +754,33 @@ function detectMergeableGroups(steps: RawStep[]): RawStep[] {
 
     // Check for a second ephemeral (3-step chain)
     const nextNext = i + 2 < result.length ? result[i + 2] : null;
-    if (
-      nextNext &&
-      nextNext.inEphemeralUI &&
-      nextNext.elementRect &&
-      nextNext.url &&
-      stripHash(nextNext.url) === stripHash(current.url) &&
-      nextNext.timestamp - current.timestamp <= 10_000
-    ) {
+    if (nextNext && nextNext.inEphemeralUI && canLinkSteps(current, nextNext, 10_000)) {
       result[i + 1] = { ...next, mergeWithNextId: `__merge_${i + 2}` };
+    }
+  }
+
+  // Same open dialog: consecutive clicks inside one modal, even when they
+  // are not an ephemeral popup chain. Still a suggestion, capped at 3 steps.
+  for (let i = 0; i < result.length; i++) {
+    const current = result[i];
+    if (current.mergeWithNextId || !current.elementRect || !current.url) continue;
+
+    const next = i + 1 < result.length ? result[i + 1] : null;
+    if (!next || next.mergeWithNextId || !canLinkSteps(current, next, 15_000) || !sharedDialogName(current, next)) {
+      continue;
+    }
+
+    result[i] = { ...current, mergeWithNextId: `__merge_${i + 1}` };
+
+    const third = i + 2 < result.length ? result[i + 2] : null;
+    if (
+      third &&
+      !third.mergeWithNextId &&
+      canLinkSteps(current, third, 15_000) &&
+      sharedDialogName(current, third) &&
+      sharedDialogName(next, third)
+    ) {
+      result[i + 1] = { ...result[i + 1], mergeWithNextId: `__merge_${i + 2}` };
     }
   }
 

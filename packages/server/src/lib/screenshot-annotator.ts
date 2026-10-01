@@ -18,15 +18,13 @@ export interface AnnotateOptions {
   viewportWidth: number;
   viewportHeight: number;
   isFirstStep?: boolean;
+  /** Viewport-space dialog content box. Nearly full-viewport boxes are ignored. */
+  cropRect?: Rect;
 }
 
 const HIGHLIGHT_COLOR = '#f97316';
-const HIGHLIGHT_GLOW = 'rgba(249,115,22,0.3)';
 const CIRCLE_RADIUS = 14;
-
-function escapeXml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
+const CROP_PAD = 16;
 
 function buildSingleHighlightSvg(
   h: Highlight,
@@ -55,12 +53,6 @@ function buildSingleHighlightSvg(
 
   const parts: string[] = [];
 
-  // Glow border
-  parts.push(
-    `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" rx="${radius}" ry="${radius}" ` +
-    `fill="none" stroke="${escapeXml(HIGHLIGHT_GLOW)}" stroke-width="${lw + 4 * scaleX}"/>`
-  );
-  // Solid border
   parts.push(
     `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" rx="${radius}" ry="${radius}" ` +
     `fill="none" stroke="${HIGHLIGHT_COLOR}" stroke-width="${lw}"/>`
@@ -213,12 +205,6 @@ function buildNumberedHighlightSvg(
 
   const parts: string[] = [];
 
-  // Glow border
-  parts.push(
-    `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" rx="${radius}" ry="${radius}" ` +
-    `fill="none" stroke="${escapeXml(HIGHLIGHT_GLOW)}" stroke-width="${lw + 4 * scaleX}"/>`
-  );
-  // Solid border
   parts.push(
     `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" rx="${radius}" ry="${radius}" ` +
     `fill="none" stroke="${HIGHLIGHT_COLOR}" stroke-width="${lw}"/>`
@@ -234,28 +220,68 @@ function buildNumberedHighlightSvg(
   return parts.join('\n');
 }
 
+/** Pixel crop of a dialog content box, or null when the box is missing or nearly full-viewport. */
+export function planCrop(
+  cropRect: Rect,
+  viewportWidth: number,
+  viewportHeight: number,
+  imgW: number,
+  imgH: number,
+): { left: number; top: number; width: number; height: number; offsetX: number; offsetY: number } | null {
+  if (viewportWidth <= 0 || viewportHeight <= 0 || imgW <= 0 || imgH <= 0) return null;
+  if (cropRect.width < 40 || cropRect.height < 40) return null;
+  if (cropRect.width >= viewportWidth * 0.92 && cropRect.height >= viewportHeight * 0.92) return null;
+
+  const scaleX = imgW / viewportWidth;
+  const scaleY = imgH / viewportHeight;
+  const x0 = Math.max(0, (cropRect.x - CROP_PAD) * scaleX);
+  const y0 = Math.max(0, (cropRect.y - CROP_PAD) * scaleY);
+  const x1 = Math.min(imgW, (cropRect.x + cropRect.width + CROP_PAD) * scaleX);
+  const y1 = Math.min(imgH, (cropRect.y + cropRect.height + CROP_PAD) * scaleY);
+  const left = Math.floor(x0);
+  const top = Math.floor(y0);
+  const width = Math.min(imgW - left, Math.max(1, Math.ceil(x1) - left));
+  const height = Math.min(imgH - top, Math.max(1, Math.ceil(y1) - top));
+  if (width < 20 || height < 20) return null;
+  if (width >= imgW - 2 && height >= imgH - 2) return null;
+  return { left, top, width, height, offsetX: left / scaleX, offsetY: top / scaleY };
+}
+
 export async function annotateScreenshot(
   rawImageBuffer: Buffer,
   options: AnnotateOptions,
 ): Promise<Buffer> {
   const { highlights, viewportWidth, viewportHeight } = options;
 
-  if (highlights.length === 0) {
-    return encodeAsWebp(rawImageBuffer, 85);
-  }
-
   const metadata = await sharp(rawImageBuffer).metadata();
   const imgW = metadata.width!;
   const imgH = metadata.height!;
 
-  const scaleX = imgW / viewportWidth;
-  const scaleY = imgH / viewportHeight;
+  const scaleX = viewportWidth > 0 ? imgW / viewportWidth : 1;
+  const scaleY = viewportHeight > 0 ? imgH / viewportHeight : 1;
 
-  // Always annotate the full screenshot — no cropping.
-  const canvasW = imgW;
-  const canvasH = imgH;
-  const offsetX = 0;
-  const offsetY = 0;
+  const crop = options.cropRect
+    ? planCrop(options.cropRect, viewportWidth, viewportHeight, imgW, imgH)
+    : null;
+
+  let base = rawImageBuffer;
+  let canvasW = imgW;
+  let canvasH = imgH;
+  let offsetX = 0;
+  let offsetY = 0;
+  if (crop) {
+    base = await sharp(rawImageBuffer)
+      .extract({ left: crop.left, top: crop.top, width: crop.width, height: crop.height })
+      .toBuffer();
+    canvasW = crop.width;
+    canvasH = crop.height;
+    offsetX = crop.offsetX;
+    offsetY = crop.offsetY;
+  }
+
+  if (highlights.length === 0) {
+    return encodeAsWebp(base, 85);
+  }
 
   const isNumbered = highlights.some((h) => h.number != null);
 
@@ -267,7 +293,7 @@ export async function annotateScreenshot(
     const svgOverlay = Buffer.from(
       `<svg xmlns="http://www.w3.org/2000/svg" width="${canvasW}" height="${canvasH}">${svgParts.join('')}</svg>`
     );
-    const composited = await sharp(rawImageBuffer)
+    const composited = await sharp(base)
       .composite([{ input: svgOverlay, top: 0, left: 0 }])
       .webp({ quality: 85, force: true })
       .toBuffer();
@@ -346,7 +372,7 @@ export async function annotateScreenshot(
   );
 
   // Composite directly to WebP; fall back to encodeAsWebp if magic bytes fail.
-  const composited = await sharp(rawImageBuffer)
+  const composited = await sharp(base)
     .composite([{ input: svgOverlay, top: 0, left: 0 }])
     .webp({ quality: 85, force: true })
     .toBuffer();

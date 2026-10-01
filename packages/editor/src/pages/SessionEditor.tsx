@@ -24,8 +24,7 @@ import {
   keepSeparate,
   getSessionEdits,
 } from '../api/client.js';
-import StepCard from '../components/StepCard.js';
-import MergePromptCard from '../components/MergePromptCard.js';
+import StepCard, { type StepMergeAction } from '../components/StepCard.js';
 import ExportPanel from '../components/ExportPanel.js';
 import ScreenshotViewer from '../components/ScreenshotViewer.js';
 import ConfirmModal from '../components/ConfirmModal.js';
@@ -342,93 +341,82 @@ export default function SessionEditor() {
                 const elements: React.ReactNode[] = [];
                 const rendered = new Set<string>();
 
-                // Walk steps sequentially.  At each step that heads a merge chain
-                // emit: Card(A), Card(B), PairPrompt([A,B]),
-                //       Card(C)?, ExtendPrompt([A,B,C])? — one prompt per boundary.
+                // Walk steps sequentially. A merge suggestion lives on the
+                // step-card tab row (Merge / Separate), not a banner between cards.
                 let i = 0;
                 while (i < steps.length) {
                   const step = steps[i];
 
                   if (rendered.has(step.id)) { i++; continue; }
 
+                  const nextStep = step.mergeWithNextId
+                    ? steps.find((s) => s.id === step.mergeWithNextId)
+                    : undefined;
+                  const linkedNext = nextStep && !rendered.has(nextStep.id) ? nextStep : undefined;
+
+                  const pairAction: StepMergeAction | undefined = linkedNext
+                    ? {
+                        groupIds: [step.id, linkedNext.id],
+                        keepSeparateIds: [step.id],
+                        title: 'Merge with the next step — they share a dialog or happened together',
+                        onMerge: handleMergeGroup,
+                        onKeepSeparate: handleKeepSeparate,
+                      }
+                    : undefined;
+
                   rendered.add(step.id);
                   elements.push(
                     <StepCard
                       key={step.id}
                       step={step}
-                      index={i}
+                      index={steps.indexOf(step)}
                       onUpdate={handleStepUpdate}
                       onDelete={handleStepDelete}
                       onScreenshotClick={handleScreenshotClick}
+                      mergeAction={pairAction}
                     />
                   );
 
-                  // Does this step link to a next mergeable step?
-                  if (step.mergeWithNextId) {
-                    const nextStep = steps.find((s) => s.id === step.mergeWithNextId);
-                    if (nextStep && !rendered.has(nextStep.id)) {
-                      const nextIndex = steps.indexOf(nextStep);
+                  if (linkedNext) {
+                    const thirdStep = linkedNext.mergeWithNextId
+                      ? steps.find((s) => s.id === linkedNext.mergeWithNextId)
+                      : undefined;
+                    const linkedThird = thirdStep && !rendered.has(thirdStep.id) ? thirdStep : undefined;
+                    const extendAction: StepMergeAction | undefined = linkedThird
+                      ? {
+                          groupIds: [step.id, linkedNext.id, linkedThird.id],
+                          keepSeparateIds: [linkedNext.id],
+                          title: 'Also merge the following step into this group',
+                          onMerge: handleMergeGroup,
+                          onKeepSeparate: handleKeepSeparate,
+                        }
+                      : undefined;
 
-                      rendered.add(nextStep.id);
+                    rendered.add(linkedNext.id);
+                    elements.push(
+                      <StepCard
+                        key={linkedNext.id}
+                        step={linkedNext}
+                        index={steps.indexOf(linkedNext)}
+                        onUpdate={handleStepUpdate}
+                        onDelete={handleStepDelete}
+                        onScreenshotClick={handleScreenshotClick}
+                        mergeAction={extendAction}
+                      />
+                    );
+
+                    if (linkedThird) {
+                      rendered.add(linkedThird.id);
                       elements.push(
                         <StepCard
-                          key={nextStep.id}
-                          step={nextStep}
-                          index={nextIndex}
+                          key={linkedThird.id}
+                          step={linkedThird}
+                          index={steps.indexOf(linkedThird)}
                           onUpdate={handleStepUpdate}
                           onDelete={handleStepDelete}
                           onScreenshotClick={handleScreenshotClick}
                         />
                       );
-
-                      // Pair prompt: "Steps A & B happened together — merge?"
-                      // Keep-separate only needs to clear A's link; B's link
-                      // (if any) is handled by the extend prompt below.
-                      elements.push(
-                        <MergePromptCard
-                          key={`mp-pair-${step.id}`}
-                          sessionId={id!}
-                          mergeGroup={[step, nextStep]}
-                          keepSeparateIds={[step.id]}
-                          mode="pair"
-                          onMerge={handleMergeGroup}
-                          onKeepSeparate={handleKeepSeparate}
-                        />
-                      );
-
-                      // Does the second step also link to a third?
-                      if (nextStep.mergeWithNextId) {
-                        const thirdStep = steps.find((s) => s.id === nextStep.mergeWithNextId);
-                        if (thirdStep && !rendered.has(thirdStep.id)) {
-                          const thirdIndex = steps.indexOf(thirdStep);
-
-                          rendered.add(thirdStep.id);
-                          elements.push(
-                            <StepCard
-                              key={thirdStep.id}
-                              step={thirdStep}
-                              index={thirdIndex}
-                              onUpdate={handleStepUpdate}
-                              onDelete={handleStepDelete}
-                              onScreenshotClick={handleScreenshotClick}
-                            />
-                          );
-
-                          // Extend prompt: "Also add step 3 into the group above?"
-                          // Merges all 3; keep-separate only unlinks the B→C link.
-                          elements.push(
-                            <MergePromptCard
-                              key={`mp-ext-${step.id}`}
-                              sessionId={id!}
-                              mergeGroup={[step, nextStep, thirdStep]}
-                              keepSeparateIds={[nextStep.id]}
-                              mode="extend"
-                              onMerge={handleMergeGroup}
-                              onKeepSeparate={handleKeepSeparate}
-                            />
-                          );
-                        }
-                      }
                     }
                   }
 

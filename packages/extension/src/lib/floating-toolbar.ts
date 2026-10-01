@@ -1,3 +1,4 @@
+/// <reference types="chrome" />
 import type { RecordingState, ExtensionMessage } from '@docext/shared';
 
 const LOGO_SVG_HTML = `
@@ -365,9 +366,18 @@ export function stopToolbarTimer() {
 }
 
 export function hideToolbar() {
-  if (toolbarHost) toolbarHost.style.display = 'none';
+  if (!toolbarHost) return;
+  toolbarHost.style.display = 'none';
+  toolbarHost.style.visibility = 'hidden';
+  toolbarHost.style.opacity = '0';
+  toolbarHost.style.transform = 'translate(-50%, 200vh)';
+  void toolbarHost.offsetHeight;
 }
 
 export function showToolbar() {
-  if (toolbarHost) toolbarHost.style.display = '';
+  if (!toolbarHost) return;
+  toolbarHost.style.display = '';
+  toolbarHost.style.visibility = '';
+  toolbarHost.style.opacity = '';
+  toolbarHost.style.transform = 'translateX(-50%)';
 }

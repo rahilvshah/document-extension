@@ -96,6 +96,8 @@ export interface ClickMeta {
   pageHeading?: string;
   openOverlays?: string[];
   buttonType?: string;
+  /** Dialog content box when this click happened inside an open modal. */
+  cropRect?: Rect;
 }
 
 export interface InputMeta {
@@ -191,6 +193,8 @@ export interface ModalMeta {
   pageHeading?: string;
   openOverlays?: string[];
   themeCapture?: 'dual' | 'same';
+  /** Dialog content box for cropping the modal screenshot. */
+  cropRect?: Rect;
 }
 
 export interface ScreenshotMeta {
@@ -201,6 +205,8 @@ export interface ScreenshotMeta {
   skipHighlight?: boolean;
   viewportSize?: { width: number; height: number };
   scrollPosition?: { x: number; y: number };
+  /** Dialog content box when a modal is open in this shot. */
+  cropRect?: Rect;
 }
 
 export type EventMetadata =
@@ -326,6 +332,7 @@ export type ExtensionMessageType =
   | 'RESUME_CAPTURE'
   | 'HIDE_TOOLBAR'
   | 'SHOW_TOOLBAR'
+  | 'GET_DIALOG_CROP'
   | 'GET_STATE'
   | 'CAPTURE_SCREENSHOT'
   | 'CAPTURE_AFTER'

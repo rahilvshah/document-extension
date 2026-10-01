@@ -9,11 +9,12 @@ import type {
   ScreenshotMeta,
   DomEdit,
 } from '@docext/shared';
-import { resolveElement, type ElementInfo } from './element-resolver.js';
+import { type ElementInfo } from './element-resolver.js';
 import {
   extractElementLayers,
   extractPageFrame,
   extractControl,
+  extractDialogCropRect,
   computeAccessibleName,
   getElementStates,
   type ExtractOptions,
@@ -21,75 +22,70 @@ import {
 
 const SENSITIVE_RE = /password|secret|token|ssn|credit.?card|cvv|pin|social.?security/i;
 
+const TEXT_LIKE_TAGS = new Set([
+  'span', 'p', 'label', 'strong', 'em', 'b', 'i', 'small', 'svg', 'path', 'img', 'text',
+]);
+const CONTROL_ROLES = new Set([
+  'button', 'link', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem', 'row',
+]);
+
+function isHighlightContainer(node: Element, rect: DOMRect): boolean {
+  const role = node.getAttribute('role') || '';
+  const tag = node.tagName.toLowerCase();
+  if (
+    role === 'dialog' || role === 'alertdialog' || role === 'menu' || role === 'listbox' ||
+    role === 'navigation' || role === 'complementary' || role === 'presentation'
+  ) return true;
+  if (tag === 'dialog' || tag === 'nav' || tag === 'aside' || tag === 'main' || tag === 'header') return true;
+  if (rect.width > window.innerWidth * 0.92 || rect.height > window.innerHeight * 0.5) return true;
+  return false;
+}
+
+/** Expand a text or icon hit to the full control row, stopping before dialogs and sidebars. */
 function pickBestHighlightTarget(hit: Element): Element {
   const actionable = hit.closest(
-    'button, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], a, input, select, textarea'
+    'button, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="tab"], [role="treeitem"], [role="link"], a'
   );
   let best: Element = actionable || hit;
   let bestRect = best.getBoundingClientRect();
+  const startTag = best.tagName.toLowerCase();
+  const startRole = best.getAttribute('role') || '';
+  const startIsControl =
+    (startTag === 'button' || startTag === 'a' || CONTROL_ROLES.has(startRole)) &&
+    bestRect.height >= 24 &&
+    bestRect.width >= 48;
+  if (startIsControl && !TEXT_LIKE_TAGS.has(startTag)) return best;
 
   let node: Element | null = best.parentElement;
   let depth = 0;
-  const bestIsTextLike = best.tagName.toLowerCase() === 'span' || best.tagName.toLowerCase() === 'p';
-  while (node && depth < 5) {
+  while (node && depth < 6) {
     const rect = node.getBoundingClientRect();
     if (rect.width < 8 || rect.height < 8) {
       node = node.parentElement;
       depth++;
       continue;
     }
+    if (isHighlightContainer(node, rect)) break;
 
-    const role = node.getAttribute('role');
+    const role = node.getAttribute('role') || '';
     const tag = node.tagName.toLowerCase();
-    const cls = node.className || '';
-    const isContainerRole = role === 'dialog' || role === 'alertdialog' || role === 'menu' || role === 'listbox';
-    const looksLikeOverlay =
-      tag === 'dialog' ||
-      /modal|dialog|drawer|sheet|overlay|backdrop|popover|portal|content/i.test(String(cls));
+    let cursor = '';
+    try { cursor = getComputedStyle(node).cursor; } catch { /* detached */ }
 
-    if (isContainerRole || looksLikeOverlay) {
-      node = node.parentElement;
-      depth++;
-      continue;
-    }
-
-    const bestArea = bestRect.width * bestRect.height;
-    const nodeArea = rect.width * rect.height;
-    if (nodeArea > bestArea * 6) {
-      node = node.parentElement;
-      depth++;
-      continue;
-    }
-
-    const isStronglyInteractive =
-      tag === 'button' ||
-      tag === 'a' ||
-      tag === 'input' ||
-      tag === 'select' ||
-      tag === 'textarea' ||
-      role === 'button' ||
-      role === 'link' ||
-      role === 'tab' ||
-      role === 'menuitem' ||
-      role === 'menuitemcheckbox' ||
-      role === 'menuitemradio' ||
-      role === 'option';
-
-    const largerThanCurrent = nodeArea > bestArea * 1.8;
-    const notHuge = rect.width <= window.innerWidth * 0.45 && rect.height <= window.innerHeight * 0.25;
-    const plausibleButtonLike =
-      bestIsTextLike &&
+    const rowLike =
       rect.height >= 28 &&
-      rect.height <= 90 &&
-      rect.width >= 120 &&
-      rect.width <= window.innerWidth * 0.8;
+      rect.height <= 72 &&
+      rect.width >= Math.max(bestRect.width * 1.25, 48) &&
+      rect.width <= window.innerWidth * 0.85;
+    const isControl = tag === 'button' || tag === 'a' || CONTROL_ROLES.has(role);
+    const pointerRow = cursor === 'pointer' && rowLike;
+    const textWrap = TEXT_LIKE_TAGS.has(best.tagName.toLowerCase()) && rowLike && rect.width <= window.innerWidth * 0.55;
 
-    if (isStronglyInteractive && largerThanCurrent && notHuge) {
+    if ((isControl && rect.height <= window.innerHeight * 0.35) || pointerRow || textWrap) {
       best = node;
       bestRect = rect;
-    } else if (plausibleButtonLike && isStronglyInteractive && largerThanCurrent && notHuge) {
-      best = node;
-      bestRect = rect;
+      if (isControl && rect.height >= 28) break;
+      if (pointerRow || textWrap) break;
     }
 
     node = node.parentElement;
@@ -97,6 +93,34 @@ function pickBestHighlightTarget(hit: Element): Element {
   }
 
   return best;
+}
+
+function highlightRectFor(el: Element, clientX: number, clientY: number): DOMRect {
+  const candidates: Element[] = [el];
+  try {
+    const hit = document.elementFromPoint(clientX, clientY);
+    if (hit) candidates.push(hit);
+  } catch { /* ignore */ }
+
+  let best = el.getBoundingClientRect();
+  let bestScore = -1;
+  const score = (r: DOMRect) => {
+    if (r.width < 8 || r.height < 8) return -1;
+    if (r.width > window.innerWidth * 0.85 || r.height > window.innerHeight * 0.4) return -1;
+    if (r.height < 22) return r.width;
+    return r.width * r.height;
+  };
+
+  for (const candidate of candidates) {
+    const target = pickBestHighlightTarget(candidate);
+    const rect = target.getBoundingClientRect();
+    const next = score(rect);
+    if (next > bestScore) {
+      best = rect;
+      bestScore = next;
+    }
+  }
+  return bestScore < 0 ? el.getBoundingClientRect() : best;
 }
 
 export function generateId(): string {
@@ -158,42 +182,8 @@ export function buildClickEvent(
   domEdits: DomEdit[],
   opts?: { inEphemeralUI?: boolean; hotPath?: boolean },
 ): RecordedEvent {
-  const r = el.getBoundingClientRect();
-  let highlightRect = r;
-  try {
-    const hit = document.elementFromPoint(e.clientX, e.clientY);
-    if (hit) {
-      const bestTarget = pickBestHighlightTarget(hit);
-      const rr = bestTarget.getBoundingClientRect();
-      const hitLooksValid = rr.width >= 8 && rr.height >= 8;
-      const role = info.role || '';
-      const originalActionable =
-        info.tag === 'button' ||
-        info.tag === 'a' ||
-        info.tag === 'input' ||
-        info.tag === 'select' ||
-        info.tag === 'textarea' ||
-        role === 'button' ||
-        role === 'menuitem' ||
-        role === 'menuitemcheckbox' ||
-        role === 'menuitemradio' ||
-        role === 'link';
-      const originalLooksControlSized =
-        originalActionable &&
-        r.width >= 20 &&
-        r.height >= 16 &&
-        r.width <= window.innerWidth * 0.6 &&
-        r.height <= window.innerHeight * 0.35;
-      const shouldPreferHit =
-        (!!opts?.inEphemeralUI && !originalLooksControlSized) ||
-        r.width < 8 ||
-        r.height < 8 ||
-        ((info.tag === 'div' || info.tag === 'span') && !info.role);
-      if (hitLooksValid && shouldPreferHit) {
-        highlightRect = rr;
-      }
-    }
-  } catch { /* safe fallback */ }
+  const highlightRect = highlightRectFor(el, e.clientX, e.clientY);
+  const cropRect = extractDialogCropRect(el);
 
   const layers = enrichFromLayers(el, { hotPath: opts?.hotPath });
   const accessibleName = layers.accessibleName || info.ariaLabel || info.text || undefined;
@@ -233,6 +223,7 @@ export function buildClickEvent(
     pageHeading: layers.pageHeading,
     openOverlays: layers.openOverlays,
     buttonType: layers.buttonType,
+    cropRect,
   };
   return {
     id: generateId(),
@@ -434,6 +425,7 @@ export function buildModalEvent(action: 'open' | 'close', el?: Element): Recorde
     viewportSize: { width: window.innerWidth, height: window.innerHeight },
     pageHeading,
     openOverlays,
+    cropRect: el ? extractDialogCropRect(el) : extractDialogCropRect(),
   };
   return {
     id: generateId(),
@@ -460,6 +452,7 @@ export function buildScreenshotEvent(label?: string): RecordedEvent {
     skipHighlight: true,
     viewportSize: { width: window.innerWidth, height: window.innerHeight },
     scrollPosition: { x: window.scrollX, y: window.scrollY },
+    cropRect: extractDialogCropRect(),
   };
   return {
     id: generateId(),

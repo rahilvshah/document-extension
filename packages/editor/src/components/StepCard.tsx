@@ -4,15 +4,26 @@ import { CSS } from '@dnd-kit/utilities';
 import { getScreenshotUrl } from '../api/client.js';
 import type { Step } from '@docext/shared';
 
+export interface StepMergeAction {
+  /** Steps combined when Merge is clicked, trigger first. */
+  groupIds: string[];
+  /** Step ids whose merge link is cleared by Keep separate. */
+  keepSeparateIds: string[];
+  title: string;
+  onMerge: (groupIds: string[]) => Promise<void>;
+  onKeepSeparate: (groupIds: string[]) => Promise<void>;
+}
+
 interface StepCardProps {
   step: Step;
   index: number;
   onUpdate: (stepId: string, field: 'title' | 'description', value: string) => void;
   onDelete: (stepId: string) => void;
   onScreenshotClick: (screenshotId: string) => void;
+  mergeAction?: StepMergeAction;
 }
 
-type FrameTab = 'annotated' | 'clean' | 'result';
+type FrameTab = 'annotated' | 'clean' | 'after';
 type ThemeTab = 'light' | 'dark' | 'both';
 
 export default memo(function StepCard({
@@ -21,10 +32,12 @@ export default memo(function StepCard({
   onUpdate,
   onDelete,
   onScreenshotClick,
+  mergeAction,
 }: StepCardProps) {
   const [editingField, setEditingField] = useState<'title' | 'description' | null>(null);
   const [draft, setDraft] = useState('');
   const [frame, setFrame] = useState<FrameTab>('annotated');
+  const [mergeBusy, setMergeBusy] = useState<'merge' | 'keep' | null>(null);
   const [theme, setTheme] = useState<ThemeTab>(
     step.themeCapture === 'same' || !step.altScreenshotId ? 'light' : 'both',
   );
@@ -55,7 +68,7 @@ export default memo(function StepCard({
         dark: showDark ? (step.beforeDarkId || step.altScreenshotId) : undefined,
       };
     }
-    if (frame === 'result') {
+    if (frame === 'after') {
       return {
         light: step.afterLightId,
         dark: showDark ? step.afterDarkId : undefined,
@@ -163,7 +176,7 @@ export default memo(function StepCard({
       </div>
 
       {/* Frame / theme tabs */}
-      {(pair.light || hasClean || hasResult) && (
+      {(pair.light || hasClean || hasResult || mergeAction) && (
         <div className="flex flex-wrap items-center gap-2 px-4 py-2 border-b border-slate-200/60 bg-slate-50/80">
           <div className="flex gap-1">
             <button type="button" className={tabBtn(frame === 'annotated')} onClick={() => setFrame('annotated')}>
@@ -179,13 +192,41 @@ export default memo(function StepCard({
             </button>
             <button
               type="button"
-              className={tabBtn(frame === 'result')}
-              onClick={() => setFrame('result')}
+              className={tabBtn(frame === 'after')}
+              onClick={() => setFrame('after')}
               disabled={!hasResult}
-              title={hasResult ? 'After-click result' : 'No after-click capture'}
+              title={hasResult ? 'Screenshot of the page after this click' : 'No after-click capture'}
             >
-              Result
+              After
             </button>
+            {mergeAction && (
+              <>
+                <button
+                  type="button"
+                  className={tabBtn(false)}
+                  disabled={!!mergeBusy}
+                  title={mergeAction.title}
+                  onClick={() => {
+                    setMergeBusy('merge');
+                    void mergeAction.onMerge(mergeAction.groupIds).finally(() => setMergeBusy(null));
+                  }}
+                >
+                  {mergeBusy === 'merge' ? 'Merging…' : 'Merge'}
+                </button>
+                <button
+                  type="button"
+                  className={tabBtn(false)}
+                  disabled={!!mergeBusy}
+                  title="Keep these steps separate"
+                  onClick={() => {
+                    setMergeBusy('keep');
+                    void mergeAction.onKeepSeparate(mergeAction.keepSeparateIds).finally(() => setMergeBusy(null));
+                  }}
+                >
+                  {mergeBusy === 'keep' ? 'Saving…' : 'Separate'}
+                </button>
+              </>
+            )}
           </div>
           {showDark && (pair.dark || step.altScreenshotId) && (
             <div className="flex gap-1 ml-auto">
